@@ -1,0 +1,11 @@
+[package]
+name = "markq-inference"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+# (embedder) and (reranker) wire `llama-cpp-2` here. 
+# stub keeps llama.cpp's vendored CMake build off the critical path.
+[dependencies]
+markq-core.workspace = true

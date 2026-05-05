@@ -1,0 +1,20 @@
+[package]
+name = "markq-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "markq"
+path = "src/main.rs"
+
+[dependencies]
+markq-core.workspace = true
+markq-index-lance.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

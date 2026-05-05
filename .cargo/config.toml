@@ -1,0 +1,17 @@
+# Bindgen (used by `llama-cpp-sys-2` to generate llama.cpp FFI bindings) needs
+# to find the clang resource directory for `stdbool.h`, `stddef.h`, etc.
+#
+# Fedora 44 ships libclang at /lib64/libclang.so but the resource directory is
+# at /usr/lib/clang/<major>/include and is not auto-discovered. The path is
+# clang-major-version-specific, so the value below may need updating after a
+# clang bump (follow-up #1 in spikes/PHASE1_FOLLOWUPS.md tracks
+# generalizing this to a build-script glob).
+#
+# Required system packages on Fedora/RHEL: clang-libs, clang-resource-filesystem
+# Debian/Ubuntu/Arch: libclang-dev / clang typically co-locates the resource dir,
+# so this env may be unset there.
+#
+# itself does not link llama.cpp (markq-inference is a stub), but the
+# config lives here so onwards inherits it without surprise.
+[env]
+BINDGEN_EXTRA_CLANG_ARGS = "-isystem /usr/lib/clang/22/include"
