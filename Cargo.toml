@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "markq-core",
+    "markq-cli",
+    "markq-index-lance",
+    "markq-inference",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Pinned versions carried forward from the Phase 0 spike workspace
+# (`spikes/Cargo.toml`). LanceDB and arrow are exact pins because lancedb is
+# sub-1.0 and minor bumps have broken APIs in the past.
+[workspace.dependencies]
+lancedb = "=0.27.2"
+arrow = "57"
+arrow-array = "57"
+arrow-schema = "57"
+
+# Async runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Errors / logging
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI / config
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+
+# Misc
+dirs = "6"
+tempfile = "3"
+
+# Internal crates
+markq-core = { path = "markq-core" }
+markq-index-lance = { path = "markq-index-lance" }
+markq-inference = { path = "markq-inference" }

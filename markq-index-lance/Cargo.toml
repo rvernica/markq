@@ -1,0 +1,24 @@
+[package]
+name = "markq-index-lance"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+markq-core.workspace = true
+
+anyhow.workspace = true
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+lancedb.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+markq-core = { workspace = true, features = ["test-harness"] }
