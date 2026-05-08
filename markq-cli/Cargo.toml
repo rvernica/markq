@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 markq-core.workspace = true
+markq-chunker.workspace = true
 markq-index-lance.workspace = true
 
 anyhow.workspace = true

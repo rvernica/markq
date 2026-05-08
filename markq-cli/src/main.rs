@@ -72,6 +72,10 @@ enum Command {
     /// Filesystem watch + incremental reindex (`--features watch`).
     Watch(WatchArgs),
 
+    /// Print chunks for a single markdown file (dev-only demo).
+    #[command(hide = true)]
+    Chunk(ChunkArgs),
+
     // === Other ===
     /// Run the MCP server over stdio.
     Serve,
@@ -130,6 +134,21 @@ struct MultiGetArgs {
 }
 
 #[derive(Args, Debug)]
+struct ChunkArgs {
+    /// Markdown file to chunk.
+    file: PathBuf,
+    /// Print chunk text bodies (default: only headers + token counts).
+    #[arg(long)]
+    text: bool,
+    /// Override the default 900-token target.
+    #[arg(long)]
+    max_tokens: Option<usize>,
+    /// Override the default 135-token (~15%) overlap.
+    #[arg(long)]
+    overlap_tokens: Option<usize>,
+}
+
+#[derive(Args, Debug)]
 struct WatchArgs {
     collection: Option<String>,
 }
@@ -166,6 +185,7 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         Command::Inspect => cmd_inspect(&dataset_path).await,
+        Command::Chunk(args) => cmd_chunk(&args),
 
         // Every other v1 subcommand has its name + arg shape registered now
         // so `markq --help` matches the final surface; bodies land in their
@@ -190,6 +210,43 @@ async fn main() -> Result<()> {
             anyhow::bail!("not implemented yet");
         }
     }
+}
+
+fn cmd_chunk(args: &ChunkArgs) -> Result<()> {
+    use markq_chunker::{chunk_markdown, ApproxTokenizer, ChunkOptions};
+
+    let src = std::fs::read_to_string(&args.file)
+        .with_context(|| format!("read {}", args.file.display()))?;
+
+    let mut opts = ChunkOptions::default();
+    if let Some(m) = args.max_tokens {
+        opts.max_tokens = m;
+    }
+    if let Some(o) = args.overlap_tokens {
+        opts.overlap_tokens = o;
+    }
+
+    let chunks = chunk_markdown(&src, &opts, &ApproxTokenizer);
+    println!("file:   {}", args.file.display());
+    println!("bytes:  {}", src.len());
+    println!(
+        "chunks: {}  (max_tokens={}, overlap_tokens={})",
+        chunks.len(),
+        opts.max_tokens,
+        opts.overlap_tokens
+    );
+    for c in &chunks {
+        println!(
+            "[{:>3}] bytes {:>7}..{:<7}  tokens={}",
+            c.index, c.start_byte, c.end_byte, c.token_count
+        );
+        if args.text {
+            println!("---");
+            println!("{}", c.text);
+            println!("---");
+        }
+    }
+    Ok(())
 }
 
 async fn cmd_inspect(dataset_path: &std::path::Path) -> Result<()> {

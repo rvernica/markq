@@ -3206,11 +3206,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "markq-chunker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pulldown-cmark",
+ "tracing",
+]
+
+[[package]]
 name = "markq-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "markq-chunker",
  "markq-core",
  "markq-index-lance",
  "tokio",
@@ -3794,6 +3804,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8991c4cbdb8bc5b11f0b074ffe286c30e523de90fee5ba8132f1399f23cb3dd7"
 dependencies = [
  "prost",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c3a14896dfa883796f1cb410461aef38810ea05f2b2c33c5aded3649095fdad"
+dependencies = [
+ "bitflags",
+ "memchr",
+ "unicase",
 ]
 
 [[package]]
