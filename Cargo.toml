@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "markq-core",
     "markq-cli",
+    "markq-chunker",
     "markq-index-lance",
     "markq-inference",
 ]
@@ -21,6 +22,11 @@ lancedb = "=0.27.2"
 arrow = "57"
 arrow-array = "57"
 arrow-schema = "57"
+
+# Markdown parsing for the chunker (Phase 2). Pinned to 0.13 because
+# the offset-iterator API and `Tag::HtmlBlock`/`Tag::FootnoteDefinition`
+# shapes are load-bearing for our top-level-block walker.
+pulldown-cmark = { version = "0.13", default-features = false }
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
@@ -44,5 +50,6 @@ tempfile = "3"
 
 # Internal crates
 markq-core = { path = "markq-core" }
+markq-chunker = { path = "markq-chunker" }
 markq-index-lance = { path = "markq-index-lance" }
 markq-inference = { path = "markq-inference" }
