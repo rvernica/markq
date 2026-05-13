@@ -3219,13 +3219,19 @@ name = "markq-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow-array",
+ "arrow-schema",
+ "blake3",
  "clap",
  "markq-chunker",
  "markq-core",
  "markq-index-lance",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "walkdir",
 ]
 
 [[package]]
@@ -3255,6 +3261,7 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "futures",
+ "lance-index",
  "lancedb",
  "markq-core",
  "tempfile",

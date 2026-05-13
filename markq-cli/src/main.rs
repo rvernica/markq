@@ -10,6 +10,8 @@ use markq_core::{default_dataset_path, Index};
 use markq_index_lance::LanceIndex;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+use markq_cli::{indexer, search};
+
 #[derive(Parser, Debug)]
 #[command(
     name = "markq",
@@ -186,15 +188,15 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Command::Inspect => cmd_inspect(&dataset_path).await,
         Command::Chunk(args) => cmd_chunk(&args),
+        Command::Index(args) => cmd_index(&dataset_path, &args).await,
+        Command::Search(args) => cmd_search(&dataset_path, &args).await,
 
         // Every other v1 subcommand has its name + arg shape registered now
         // so `markq --help` matches the final surface; bodies land in their
         // respective milestones.
-        Command::Index(_)
-        | Command::Embed(_)
+        Command::Embed(_)
         | Command::Collection(_)
         | Command::Context(_)
-        | Command::Search(_)
         | Command::Vsearch(_)
         | Command::Query(_)
         | Command::Rerank(_)
@@ -210,6 +212,60 @@ async fn main() -> Result<()> {
             anyhow::bail!("not implemented yet");
         }
     }
+}
+
+async fn cmd_index(dataset_path: &std::path::Path, args: &IndexArgs) -> Result<()> {
+    if args.collection.is_some() {
+        anyhow::bail!("multi-collection indexing is not implemented yet; omit -c for now");
+    }
+    let root = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
+    let idx = LanceIndex::open_or_create(dataset_path)
+        .await
+        .context("open or create dataset")?;
+    let report = indexer::run_index(&idx, &root).await?;
+    println!(
+        "indexed {} file(s), {} chunk(s) into {}",
+        report.files,
+        report.chunks,
+        idx.path().display()
+    );
+    Ok(())
+}
+
+async fn cmd_search(dataset_path: &std::path::Path, args: &QueryArgs) -> Result<()> {
+    if args.collection.is_some() {
+        anyhow::bail!("collection filtering is not implemented yet; omit -c for now");
+    }
+    if args.explain {
+        anyhow::bail!("--explain is not implemented yet");
+    }
+
+    let format = match (args.json, args.files) {
+        (true, true) => anyhow::bail!("--json and --files are mutually exclusive"),
+        (true, false) => search::Format::Json,
+        (false, true) => search::Format::Files,
+        (false, false) => search::Format::Table,
+    };
+    let opts = search::SearchOptions {
+        top_k: if args.all { None } else { Some(args.top_k) },
+        min_score: args.min_score,
+    };
+    // Ask the index for either the requested top-k or the `--all` budget.
+    let k = opts.top_k.unwrap_or(search::ALL_BUDGET);
+
+    let idx = LanceIndex::open_or_create(dataset_path)
+        .await
+        .context("open or create dataset")?;
+    let raw = idx
+        .bm25(&args.query, k, None)
+        .await
+        .context("bm25 search")?;
+    let hits = search::apply_filters(raw, &opts);
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    search::write_results(&mut out, &hits, format)?;
+    Ok(())
 }
 
 fn cmd_chunk(args: &ChunkArgs) -> Result<()> {

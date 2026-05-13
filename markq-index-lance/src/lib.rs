@@ -6,13 +6,20 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Float32Type, Int32Type};
+use arrow_array::{Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use futures::TryStreamExt;
+use lance_index::scalar::FullTextSearchQuery;
+use lancedb::index::scalar::FtsIndexBuilder;
+use lancedb::index::Index as LanceIndexKind;
+use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use lancedb::{Connection, Table};
 use markq_core::{
-    chunk_arrow_schema, ChunkHit, DatasetMetadata, Error, Index, Result, EMBEDDING_DIM_DEFAULT,
-    KEY_EMBEDDER_DIM, KEY_EMBEDDER_MODEL, KEY_LANCEDB_CRATE_VERSION,
+    chunk_arrow_schema, ChunkColumn, ChunkHit, DatasetMetadata, Error, Index, Result,
+    EMBEDDING_DIM_DEFAULT, KEY_EMBEDDER_DIM, KEY_EMBEDDER_MODEL, KEY_LANCEDB_CRATE_VERSION,
     KEY_LANCE_FILE_FORMAT_VERSION, KEY_LANCE_MANIFEST_VERSION, KEY_SCHEMA_VERSION, SCHEMA_VERSION,
 };
 use tracing::{debug, info};
@@ -166,6 +173,92 @@ async fn write_initial_metadata(table: &Table) -> Result<()> {
     Ok(())
 }
 
+/// Build (or replace) the BM25 FTS index on the `text` column. Tokenizer
+/// settings mirror the spike 0c configuration that achieved 0.99 overlap@10
+/// against the qmd reference: `simple` base + lower-case + Porter stem +
+/// ASCII folding + stop-words preserved.
+async fn ensure_fts_index(table: &Table) -> Result<()> {
+    let params = FtsIndexBuilder::default()
+        .base_tokenizer("simple".to_string())
+        .lower_case(true)
+        .stem(true)
+        .remove_stop_words(false)
+        .ascii_folding(true);
+    table
+        .create_index(&[ChunkColumn::TEXT], LanceIndexKind::FTS(params))
+        .replace(true)
+        .execute()
+        .await
+        .context("create FTS index on text")
+        .map_err(Error::Backend)?;
+    Ok(())
+}
+
+async fn bm25_search(table: &Table, query: &str, k: usize) -> Result<Vec<ChunkHit>> {
+    let mut stream = table
+        .query()
+        .full_text_search(FullTextSearchQuery::new(query.to_string()))
+        .select(Select::Columns(vec![
+            ChunkColumn::ID.to_string(),
+            ChunkColumn::PATH.to_string(),
+            ChunkColumn::URI.to_string(),
+            ChunkColumn::CHUNK_INDEX.to_string(),
+            ChunkColumn::TEXT.to_string(),
+            "_score".to_string(),
+        ]))
+        .limit(k)
+        .execute()
+        .await
+        .context("execute full_text_search")
+        .map_err(Error::Backend)?;
+
+    let mut hits = Vec::new();
+    while let Some(batch) = stream
+        .try_next()
+        .await
+        .context("read fts result batch")
+        .map_err(Error::Backend)?
+    {
+        let id = column_string(&batch, ChunkColumn::ID)?;
+        let path = column_string(&batch, ChunkColumn::PATH)?;
+        let uri = column_string(&batch, ChunkColumn::URI)?;
+        let chunk_index = batch
+            .column_by_name(ChunkColumn::CHUNK_INDEX)
+            .context("missing chunk_index column")
+            .map_err(Error::Backend)?
+            .as_primitive::<Int32Type>();
+        let text = column_string(&batch, ChunkColumn::TEXT)?;
+        let score = batch
+            .column_by_name("_score")
+            .context("missing _score column")
+            .map_err(Error::Backend)?
+            .as_primitive::<Float32Type>();
+
+        for i in 0..batch.num_rows() {
+            hits.push(ChunkHit {
+                id: id.value(i).to_string(),
+                path: path.value(i).to_string(),
+                uri: uri.value(i).to_string(),
+                chunk_index: chunk_index.value(i),
+                text: text.value(i).to_string(),
+                score: score.value(i),
+            });
+        }
+    }
+    Ok(hits)
+}
+
+fn column_string<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
+    let arr = batch
+        .column_by_name(name)
+        .with_context(|| format!("missing {name} column"))
+        .map_err(Error::Backend)?;
+    arr.as_any()
+        .downcast_ref::<StringArray>()
+        .with_context(|| format!("{name} column is not utf8"))
+        .map_err(Error::Backend)
+}
+
 async fn read_metadata(table: &Table) -> Result<DatasetMetadata> {
     let native = table
         .as_native()
@@ -242,6 +335,11 @@ impl Index for LanceIndex {
             .await
             .context("append chunks")
             .map_err(Error::Backend)?;
+        // Build / refresh the BM25 FTS index on `text`. Lance treats
+        // `create_index` as create-or-replace, so calling per upsert keeps
+        // the index in sync without separate bookkeeping. will
+        // gate this behind a "rebuild if fragmentation > N%" check.
+        ensure_fts_index(&self.table).await?;
         Ok(())
     }
 
@@ -262,15 +360,26 @@ impl Index for LanceIndex {
 
     async fn bm25(
         &self,
-        _query: &str,
-        _k: usize,
+        query: &str,
+        k: usize,
         _collection: Option<&str>,
     ) -> Result<Vec<ChunkHit>> {
-        // BM25 retrieval lands in (after the FTS index is built and
-        // PHASE1_FOLLOWUPS #2 hyphen-aware sanitizer is ported). Returning
-        // an empty result keeps the trait satisfied without a panic on dev
-        // wiring.
-        Ok(Vec::new())
+        // PHASE1_FOLLOWUPS #2 (hyphen-aware FTS5 sanitizer) lands with the
+        // hybrid path in ; for we pass the raw query through
+        // and let LanceDB's tokenizer match document-side terms. The 0c
+        // spike showed this recalls hyphenated identifiers correctly on the
+        // lance side — the regression was specifically on the qmd / SQLite
+        // FTS5 side, which we don't ship.
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        // No rows → no FTS index has been built yet. Short-circuit so the
+        // contract test (which calls bm25 on a fresh dataset) doesn't trip
+        // a "missing index" error from Lance.
+        if self.count_rows().await? == 0 {
+            return Ok(Vec::new());
+        }
+        bm25_search(&self.table, query, k).await
     }
 
     async fn vector(
