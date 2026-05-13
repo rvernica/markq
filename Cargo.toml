@@ -19,9 +19,20 @@ license = "MIT OR Apache-2.0"
 # sub-1.0 and minor bumps have broken APIs in the past.
 [workspace.dependencies]
 lancedb = "=0.27.2"
+# `lance-index` re-exports `FullTextSearchQuery`, which lancedb 0.27.2 takes
+# by-value on `query().full_text_search(..)`. Pinned to the version lancedb
+# 0.27.2 itself depends on; bumping in lockstep is the only safe path.
+lance-index = "=4.0.0"
 arrow = "57"
 arrow-array = "57"
 arrow-schema = "57"
+
+# File walking for `markq index`.
+walkdir = "2"
+# Content hashing for incremental reindex (Phase 8 reads the same column).
+blake3 = "1"
+# `--json` output (Phase 3) and MCP responses (Phase 12).
+serde_json = "1"
 
 # Markdown parsing for the chunker (Phase 2). Pinned to 0.13 because
 # the offset-iterator API and `Tag::HtmlBlock`/`Tag::FootnoteDefinition`
