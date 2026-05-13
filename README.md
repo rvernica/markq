@@ -53,6 +53,15 @@ On Fedora 44, the Rust workspace inherits `BINDGEN_EXTRA_CLANG_ARGS` from
 `/usr/lib/clang/<major>/include`. Adjust the path if your clang version
 differs.
 
+### Git hooks
+
+A tracked `pre-commit` hook in `.githooks/` runs `cargo fmt --all -- --check`
+on commits that touch `*.rs`. Enable it once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
 ## Quick demo
 
 ```sh

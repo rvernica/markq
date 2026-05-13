@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Verify staged Rust code is rustfmt-clean. Fails (does not auto-fix) so the
+# commit reflects exactly what was reviewed. Run `cargo fmt --all` and re-stage
+# to fix.
+set -euo pipefail
+
+if ! git diff --cached --name-only --diff-filter=ACMR | grep -q '\.rs$'; then
+    exit 0
+fi
+
+if ! cargo fmt --all -- --check; then
+    echo
+    echo "pre-commit: rustfmt check failed. Run 'cargo fmt --all' and re-stage." >&2
+    exit 1
+fi
