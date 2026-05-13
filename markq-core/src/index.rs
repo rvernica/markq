@@ -57,12 +57,7 @@ pub trait Index: Send + Sync {
 
     /// BM25 retrieval over the `text` column. `collection` is reserved for
     /// Phase 10 filter pushdown.
-    async fn bm25(
-        &self,
-        query: &str,
-        k: usize,
-        collection: Option<&str>,
-    ) -> Result<Vec<ChunkHit>>;
+    async fn bm25(&self, query: &str, k: usize, collection: Option<&str>) -> Result<Vec<ChunkHit>>;
 
     /// Vector KNN retrieval. Embedding dim must match the dataset's recorded
     /// dim (`metadata().embedder_dim`).

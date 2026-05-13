@@ -19,6 +19,4 @@ pub use metadata::{
     KEY_LANCE_FILE_FORMAT_VERSION, KEY_LANCE_MANIFEST_VERSION, KEY_SCHEMA_VERSION, SCHEMA_VERSION,
 };
 pub use registry::{CollectionEntry, Registry};
-pub use schema::{
-    chunk_arrow_schema, default_dataset_path, ChunkColumn, EMBEDDING_DIM_DEFAULT,
-};
+pub use schema::{chunk_arrow_schema, default_dataset_path, ChunkColumn, EMBEDDING_DIM_DEFAULT};
