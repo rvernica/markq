@@ -91,15 +91,11 @@ pub fn segment(src: &str) -> Vec<Block> {
                     }
                 }
             }
-            Event::Rule => {
-                if depth == 0 {
-                    push_block(&mut blocks, src, BlockKind::Rule, range.start, range.end);
-                }
+            Event::Rule if depth == 0 => {
+                push_block(&mut blocks, src, BlockKind::Rule, range.start, range.end);
             }
-            Event::Html(_) => {
-                if depth == 0 {
-                    push_block(&mut blocks, src, BlockKind::Html, range.start, range.end);
-                }
+            Event::Html(_) if depth == 0 => {
+                push_block(&mut blocks, src, BlockKind::Html, range.start, range.end);
             }
             // Text / Code / SoftBreak / HardBreak / etc. only matter inside a
             // block (depth > 0); their bytes are already covered by the
@@ -180,11 +176,7 @@ mod tests {
         let kinds: Vec<_> = blocks.iter().map(|b| b.kind).collect();
         assert_eq!(
             kinds,
-            vec![
-                BlockKind::Paragraph,
-                BlockKind::Code,
-                BlockKind::Paragraph
-            ]
+            vec![BlockKind::Paragraph, BlockKind::Code, BlockKind::Paragraph]
         );
         // The code block must contain its opening and closing fences.
         let code = blocks.iter().find(|b| b.kind == BlockKind::Code).unwrap();

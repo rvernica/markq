@@ -20,7 +20,7 @@ impl Tokenize for ApproxTokenizer {
         if bytes == 0 {
             0
         } else {
-            (bytes + 3) / 4
+            bytes.div_ceil(4)
         }
     }
 }

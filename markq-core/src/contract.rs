@@ -32,9 +32,17 @@ pub async fn run_contract<I: Index>(idx: &I) {
     // query methods are wired but return empty. The contract is
     // "no panic, returns an empty Vec" so can light them up
     // without changing trait shape.
-    assert!(idx.bm25("anything", 10, None).await.expect("bm25").is_empty());
+    assert!(idx
+        .bm25("anything", 10, None)
+        .await
+        .expect("bm25")
+        .is_empty());
     let dummy = vec![0.0f32; 4];
-    assert!(idx.vector(&dummy, 10, None).await.expect("vector").is_empty());
+    assert!(idx
+        .vector(&dummy, 10, None)
+        .await
+        .expect("vector")
+        .is_empty());
     let (lex, vec) = idx.hybrid("x", &dummy, 10, None).await.expect("hybrid");
     assert!(lex.is_empty() && vec.is_empty());
 

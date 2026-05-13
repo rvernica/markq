@@ -48,10 +48,7 @@ impl LanceIndex {
     /// Same as `open_or_create` but lets callers (e.g. tests) override the
     /// embedding dim. Production code should use the default until 
     /// wires per-embedder dim into config.
-    pub async fn open_or_create_with_dim(
-        dataset_path: &Path,
-        embedding_dim: i32,
-    ) -> Result<Self> {
+    pub async fn open_or_create_with_dim(dataset_path: &Path, embedding_dim: i32) -> Result<Self> {
         // LanceDB's `connect(uri)` opens a *database directory* that holds
         // many tables; each table lives at `<uri>/<table_name>.lance/`. We
         // treat the user-facing `dataset_path` as the table directory itself
@@ -275,7 +272,9 @@ async fn read_metadata(table: &Table) -> Result<DatasetMetadata> {
     let config: &HashMap<String, String> = &manifest.config;
 
     fn require<'a>(c: &'a HashMap<String, String>, key: &'static str) -> Result<&'a str> {
-        c.get(key).map(String::as_str).ok_or(Error::MetadataMissingKey(key))
+        c.get(key)
+            .map(String::as_str)
+            .ok_or(Error::MetadataMissingKey(key))
     }
 
     let schema_version: u32 = require(config, KEY_SCHEMA_VERSION)?
@@ -284,8 +283,7 @@ async fn read_metadata(table: &Table) -> Result<DatasetMetadata> {
     let lance_manifest_version: u64 = require(config, KEY_LANCE_MANIFEST_VERSION)?
         .parse()
         .map_err(|_| Error::MetadataMissingKey(KEY_LANCE_MANIFEST_VERSION))?;
-    let lance_file_format_version =
-        require(config, KEY_LANCE_FILE_FORMAT_VERSION)?.to_string();
+    let lance_file_format_version = require(config, KEY_LANCE_FILE_FORMAT_VERSION)?.to_string();
     let lancedb_crate_version = require(config, KEY_LANCEDB_CRATE_VERSION)?.to_string();
     let embedder_model = config.get(KEY_EMBEDDER_MODEL).cloned();
     let embedder_dim = config

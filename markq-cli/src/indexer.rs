@@ -9,9 +9,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use arrow_array::{
-    new_null_array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray,
-};
+use arrow_array::{new_null_array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::SchemaRef;
 use markq_chunker::{chunk_markdown, ApproxTokenizer, ChunkOptions};
 use markq_core::{ChunkColumn, Index, SCHEMA_VERSION};
@@ -59,7 +57,10 @@ pub async fn run_index<I: Index>(idx: &I, root: &Path) -> Result<IndexReport> {
 
     if row_files.is_empty() {
         info!(path = %root.display(), "no markdown files found");
-        return Ok(IndexReport { files: 0, chunks: 0 });
+        return Ok(IndexReport {
+            files: 0,
+            chunks: 0,
+        });
     }
 
     let batch = build_record_batch(&schema, &row_files)?;
@@ -192,4 +193,3 @@ fn build_record_batch(schema: &SchemaRef, files: &[FileRows]) -> Result<RecordBa
 
     RecordBatch::try_new(schema.clone(), cols).context("build chunk RecordBatch")
 }
-
