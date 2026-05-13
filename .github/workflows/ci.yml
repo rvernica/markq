@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Override the Fedora-specific clang resource path set in .cargo/config.toml.
+  # Ubuntu's clang co-locates its resource directory, so bindgen finds it
+  # automatically. Leaving this empty avoids a non-existent -isystem path.
+  BINDGEN_EXTRA_CLANG_ARGS: ""
+
+jobs:
+  test:
+    name: test (ubuntu-latest, stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test
+        run: cargo test --workspace --all-targets
