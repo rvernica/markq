@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
 
+# Cancel in-progress runs on the same ref (PR branch / main) when a new
+# commit arrives, so rapid pushes don't pile up redundant queued builds.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -39,3 +45,9 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --all-targets
+
+      - name: cargo test --doc
+        # --all-targets above deliberately excludes doctests; run them
+        # separately so /// examples in markq-core/markq-cli/... are
+        # compiled and exercised in CI.
+        run: cargo test --workspace --doc
