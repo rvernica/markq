@@ -2,14 +2,44 @@
 # Verify staged Rust code is rustfmt-clean. Fails (does not auto-fix) so the
 # commit reflects exactly what was reviewed. Run `cargo fmt --all` and re-stage
 # to fix.
+#
+# Checks the *staged blob content* of each .rs file (not the working tree), so
+# unstaged drift elsewhere won't make the hook fail, and staged-but-modified
+# files are checked as they will appear in the commit.
 set -euo pipefail
 
-if ! git diff --cached --name-only --diff-filter=ACMR | grep -q '\.rs$'; then
+# Friendly error if the toolchain isn't on PATH (common when committing from a
+# GUI whose environment doesn't inherit rustup's shims).
+if ! command -v rustfmt >/dev/null 2>&1; then
+    echo "pre-commit: rustfmt not found on PATH." >&2
+    echo "Install via rustup (https://rustup.rs) or skip this hook with --no-verify." >&2
+    exit 1
+fi
+
+# Collect staged .rs paths into an array. `|| true` so an empty match (no .rs
+# files staged) doesn't trip `set -e` via grep's exit code.
+mapfile -t staged < <(
+    git diff --cached --name-only --diff-filter=ACMR -z \
+        | tr '\0' '\n' \
+        | grep -E '\.rs$' || true
+)
+
+if [[ ${#staged[@]} -eq 0 ]]; then
     exit 0
 fi
 
-if ! cargo fmt --all -- --check; then
-    echo
-    echo "pre-commit: rustfmt check failed. Run 'cargo fmt --all' and re-stage." >&2
+fail=0
+for f in "${staged[@]}"; do
+    # Feed the *staged blob* (index version) to rustfmt --check, not the
+    # working-tree file. `git show :<path>` reads the index entry directly.
+    if ! git show ":$f" | rustfmt --check --edition 2021 >/dev/null 2>&1; then
+        echo "pre-commit: rustfmt check failed for $f" >&2
+        fail=1
+    fi
+done
+
+if [[ $fail -ne 0 ]]; then
+    echo >&2
+    echo "Run 'cargo fmt --all' and re-stage the affected files." >&2
     exit 1
 fi
