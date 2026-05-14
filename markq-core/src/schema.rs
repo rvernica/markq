@@ -39,8 +39,10 @@ impl ChunkColumn {
 /// The chunk Arrow schema — final shape, columns reserved for v1.5 features.
 pub fn chunk_arrow_schema(embedding_dim: i32) -> SchemaRef {
     Arc::new(Schema::new(vec![
-        // Stable chunk identity. Hash of (content_hash, chunk_index) so the
-        // same chunk in the same file across re-indexes has the same id.
+        // Stable chunk identity. Hash of (uri, content_hash, chunk_index)
+        // so the same chunk in the same file across re-indexes has the same
+        // id, but distinct files with identical content (duplicated READMEs,
+        // generated docs, vendored notes) get distinct ids.
         Field::new(ChunkColumn::ID, DataType::Utf8, false),
         // Routing column for `-c <name>` filter pushdown.
         // Always populated; defaults to "default" before multi-collection lands.

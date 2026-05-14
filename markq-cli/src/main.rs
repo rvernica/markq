@@ -245,12 +245,21 @@ async fn cmd_search(dataset_path: &std::path::Path, args: &QueryArgs) -> Result<
         top_k: if args.all { None } else { Some(args.top_k) },
         min_score: args.min_score,
     };
-    // Ask the index for either the requested top-k or the `--all` budget.
-    let k = opts.top_k.unwrap_or(search::ALL_BUDGET);
 
     let idx = LanceIndex::open_or_create(dataset_path)
         .await
         .context("open or create dataset")?;
+    // For `--all`, size `k` from the row count so the BM25 query is not
+    // silently truncated by a hardcoded budget. A query can't match more
+    // chunks than exist.
+    let k = match opts.top_k {
+        Some(k) => k,
+        None => idx
+            .count_rows()
+            .await
+            .context("count rows for --all")?
+            .max(1),
+    };
     let raw = idx
         .bm25(&args.query, k, None)
         .await
