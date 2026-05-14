@@ -110,7 +110,6 @@ pub fn chunk_markdown(src: &str, opts: &ChunkOptions, tok: &dyn Tokenize) -> Vec
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut i = 0usize;
     let n = raw_blocks.len();
-    let preamble_end = body_start;
 
     while i < n {
         // Decide overlap seed: walk backwards from `i` over the previous
@@ -127,7 +126,14 @@ pub fn chunk_markdown(src: &str, opts: &ChunkOptions, tok: &dyn Tokenize) -> Vec
             // whitespace before the first block) so byte 0 is covered.
             0
         } else {
-            raw_blocks[overlap_start_block].start
+            // Clamp to the previous chunk's end so inter-block whitespace
+            // never becomes an uncovered gap — matters when `overlap_tokens
+            // == 0` (or when `overlap_seed` declines to rewind, e.g. across
+            // a heading boundary). Coverage is "start[i+1] <= end[i]"; with
+            // a real overlap this clamp is a no-op.
+            let candidate = raw_blocks[overlap_start_block].start;
+            let prev_end = chunks.last().unwrap().end_byte;
+            candidate.min(prev_end)
         };
 
         // Accumulate tokens from `overlap_start_block` through some `j > i`,
@@ -165,12 +171,9 @@ pub fn chunk_markdown(src: &str, opts: &ChunkOptions, tok: &dyn Tokenize) -> Vec
             }
         }
 
-        // Always make at least one block of forward progress so we don't
-        // loop forever on a single oversize block.
-        if j == i {
-            j = i + 1;
-            acc_tokens += block_tokens[i];
-        }
+        // Inner loop guarantees at least one block of forward progress on
+        // its first iteration (both break conditions gate on `j > i`).
+        debug_assert!(j > i, "packer must always advance at least one block");
 
         let end_byte = raw_blocks[j - 1].end;
         // For chunks after the first, ensure start <= end (overlap_seed can
@@ -179,9 +182,6 @@ pub fn chunk_markdown(src: &str, opts: &ChunkOptions, tok: &dyn Tokenize) -> Vec
         // Tail of the last chunk should swallow trailing whitespace so byte
         // coverage holds without an empty trailing chunk.
         let end_byte = if j == n { src.len() } else { end_byte };
-        // First chunk always starts at 0 to absorb any pre-block whitespace
-        // / frontmatter; we already set chunk_start_byte = 0 above.
-        let _ = preamble_end;
 
         let text = src[start_byte..end_byte].to_string();
         let token_count = tok.count_tokens(&text);

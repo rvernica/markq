@@ -209,6 +209,30 @@ fn long_doc_splits_at_heading_boundaries_when_possible() {
 }
 
 #[test]
+fn zero_overlap_still_covers_inter_block_whitespace() {
+    // Regression: with `overlap_tokens = 0` (or when overlap_seed declines
+    // to rewind across a heading boundary), the next chunk would start at
+    // raw_blocks[i].start while the previous chunk ended at
+    // raw_blocks[i-1].end. Any inter-block whitespace between those two
+    // offsets used to become an uncovered gap, violating assert_full_coverage.
+    let mut src = String::new();
+    for i in 0..6 {
+        src.push_str(&format!(
+            "# Section {i}\n\nParagraph {i} with enough body text to push the \
+            packer over its tight budget and force a split on the next heading.\n\n"
+        ));
+    }
+    let opts = ChunkOptions {
+        max_tokens: 60,
+        overlap_tokens: 0,
+        min_tokens: 8,
+    };
+    let out = chunk_markdown(&src, &opts, &ApproxTokenizer);
+    assert!(out.len() >= 2, "tight budget should force a split");
+    assert_full_coverage(&src, &out);
+}
+
+#[test]
 fn deterministic_output_for_same_input() {
     let src = "# A\n\npara one\n\n# B\n\npara two\n\n# C\n\npara three\n";
     let opts = ChunkOptions::default();

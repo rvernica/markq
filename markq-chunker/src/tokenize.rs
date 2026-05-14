@@ -12,15 +12,19 @@ pub trait Tokenize: Sync {
 /// Approximate tokenizer: ~4 chars per token, rounded up. Deterministic and
 /// allocation-free. Good enough to drive packing decisions in Phase 2 — the
 /// 900-token budget is itself a starting heuristic, not a hard contract.
+///
+/// Uses `chars().count()` rather than `text.len()` so non-ASCII content
+/// (CJK, accented Latin, emoji) isn't over-counted by the 2–4x byte/char
+/// ratio. Phase 4 swaps this for the real Qwen tokenizer.
 pub struct ApproxTokenizer;
 
 impl Tokenize for ApproxTokenizer {
     fn count_tokens(&self, text: &str) -> usize {
-        let bytes = text.len();
-        if bytes == 0 {
+        let chars = text.chars().count();
+        if chars == 0 {
             0
         } else {
-            bytes.div_ceil(4)
+            chars.div_ceil(4)
         }
     }
 }
