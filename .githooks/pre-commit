@@ -17,10 +17,12 @@ if ! command -v rustfmt >/dev/null 2>&1; then
 fi
 
 # Collect staged .rs paths into an array. `|| true` so an empty match (no .rs
-# files staged) doesn't trip `set -e` via grep's exit code.
+# files staged) doesn't trip `set -e` via grep's exit code. We deliberately
+# don't use `-z` here: the script can't handle embedded newlines in paths
+# anyway (the `for f in "${staged[@]}"` loop assumes newline-delimited), and
+# pretending otherwise was misleading.
 mapfile -t staged < <(
-    git diff --cached --name-only --diff-filter=ACMR -z \
-        | tr '\0' '\n' \
+    git diff --cached --name-only --diff-filter=ACMR \
         | grep -E '\.rs$' || true
 )
 
@@ -28,12 +30,27 @@ if [[ ${#staged[@]} -eq 0 ]]; then
     exit 0
 fi
 
+# Derive the edition from the workspace Cargo.toml so an edition bump (2021 ->
+# 2024) doesn't silently desync from `cargo fmt`. Falls back to 2021 if the
+# field isn't found.
+edition="$(
+    grep -m1 -E '^edition\s*=' Cargo.toml 2>/dev/null \
+        | sed -E 's/.*"([^"]+)".*/\1/' \
+        || true
+)"
+edition="${edition:-2021}"
+
 fail=0
 for f in "${staged[@]}"; do
     # Feed the *staged blob* (index version) to rustfmt --check, not the
     # working-tree file. `git show :<path>` reads the index entry directly.
-    if ! git show ":$f" | rustfmt --check --edition 2021 >/dev/null 2>&1; then
+    # Capture output so we can print the offending diff with a per-file
+    # header on failure (rustfmt --check writes the diff to stdout).
+    if ! output="$(git show ":$f" | rustfmt --check --edition "$edition" 2>&1)"; then
         echo "pre-commit: rustfmt check failed for $f" >&2
+        if [[ -n $output ]]; then
+            printf '%s\n' "$output" >&2
+        fi
         fail=1
     fi
 done
