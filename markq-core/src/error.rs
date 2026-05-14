@@ -38,6 +38,14 @@ pub enum Error {
     #[error("dataset metadata missing required key: {0}")]
     MetadataMissingKey(&'static str),
 
+    #[error("dataset metadata key {key:?} has invalid value {value:?}: {source}")]
+    MetadataInvalidValue {
+        key: &'static str,
+        value: String,
+        #[source]
+        source: std::num::ParseIntError,
+    },
+
     #[error("backend error: {0}")]
     Backend(#[from] anyhow::Error),
 }

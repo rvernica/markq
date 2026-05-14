@@ -84,13 +84,20 @@ pub fn chunk_arrow_schema(embedding_dim: i32) -> SchemaRef {
     ]))
 }
 
-/// Default dataset path: `~/.markq/chunks.lance`.
+/// The markq home directory: `~/.markq`.
 ///
-/// Falls back to `./.markq/chunks.lance` when `dirs::home_dir()` is unset
-/// (CI sandboxes, containers without `$HOME`).
-pub fn default_dataset_path() -> PathBuf {
+/// Falls back to `./.markq` when `dirs::home_dir()` is unset (CI sandboxes,
+/// containers without `$HOME`). All on-disk markq state (dataset, registry,
+/// model cache) hangs off this directory.
+pub fn markq_home() -> PathBuf {
     let mut p = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     p.push(".markq");
+    p
+}
+
+/// Default dataset path: `~/.markq/chunks.lance`.
+pub fn default_dataset_path() -> PathBuf {
+    let mut p = markq_home();
     p.push("chunks.lance");
     p
 }

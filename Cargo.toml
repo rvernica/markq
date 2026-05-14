@@ -12,7 +12,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 publish = false
-license = "MIT OR Apache-2.0"
+license = "MIT"
 
 # Pinned versions carried forward from the Phase 0 spike workspace
 # (`spikes/Cargo.toml`). LanceDB and arrow are exact pins because lancedb is

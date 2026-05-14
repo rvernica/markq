@@ -42,7 +42,6 @@ markq 0.1.0
 
 ```
 --dataset <PATH>   Override ~/.markq/chunks.lance for this invocation.
---offline          Forward-compat parsing; not yet enforced.
 RUST_LOG=...       Standard tracing-subscriber filter. Default is `warn`.
                    Examples: `markq=info`, `markq_index_lance=debug`.
 ```
@@ -102,7 +101,6 @@ Options:
   -c, --collection <COLLECTION>
       --dataset <DATASET>        Path to the chunk dataset. Defaults to `~/.markq/chunks.lance`
       --json
-      --offline                  Refuse network calls (model downloads, etc.). Currently parsed but not yet enforced — wires up once `hf-hub` model downloads land
       --files
       --all
   -n <TOP_K>                     [default: 10]

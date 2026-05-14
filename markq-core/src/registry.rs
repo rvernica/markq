@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::schema::markq_home;
 
 /// One entry per registered collection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -35,8 +36,7 @@ pub struct Registry {
 impl Registry {
     /// Default registry path: `~/.markq/collections.toml`.
     pub fn default_path() -> PathBuf {
-        let mut p = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        p.push(".markq");
+        let mut p = markq_home();
         p.push("collections.toml");
         p
     }
