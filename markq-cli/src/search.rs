@@ -18,17 +18,12 @@ pub enum Format {
 
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
-    /// Hard cap on returned hits. `None` means "no cap" (the `--all` flag
-    /// from phase.md). The lower-level retriever is asked for this many
-    /// (or a generous default when uncapped).
+    /// Hard cap on returned hits. `None` means "no cap" (the `--all` flag).
+    /// When `None`, the caller is responsible for sizing `k` from the
+    /// dataset's row count so no matches are silently dropped.
     pub top_k: Option<usize>,
     pub min_score: Option<f32>,
 }
-
-/// How many candidates to ask the index for when the user passed `--all`.
-/// Phase 3's BM25 returns at most this many; Phase 9's `--all` will widen
-/// it once the index reports its own row count.
-pub const ALL_BUDGET: usize = 1024;
 
 pub fn apply_filters(mut hits: Vec<ChunkHit>, opts: &SearchOptions) -> Vec<ChunkHit> {
     if let Some(min) = opts.min_score {

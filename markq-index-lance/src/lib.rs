@@ -6,9 +6,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use arrow_array::cast::AsArray;
-use arrow_array::types::{Float32Type, Int32Type};
-use arrow_array::{Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray};
+use arrow_array::{
+    Array, Float32Array, Int32Array, RecordBatch, RecordBatchIterator, RecordBatchReader,
+    StringArray,
+};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use futures::TryStreamExt;
@@ -211,17 +212,13 @@ async fn bm25_search(table: &Table, query: &str, k: usize) -> Result<Vec<ChunkHi
         let id = column_string(&batch, ChunkColumn::ID)?;
         let path = column_string(&batch, ChunkColumn::PATH)?;
         let uri = column_string(&batch, ChunkColumn::URI)?;
-        let chunk_index = batch
-            .column_by_name(ChunkColumn::CHUNK_INDEX)
-            .context("missing chunk_index column")
-            .map_err(Error::Backend)?
-            .as_primitive::<Int32Type>();
+        let chunk_index = column_int32(&batch, ChunkColumn::CHUNK_INDEX)?;
         let text = column_string(&batch, ChunkColumn::TEXT)?;
-        let score = batch
-            .column_by_name("_score")
-            .context("missing _score column")
-            .map_err(Error::Backend)?
-            .as_primitive::<Float32Type>();
+        // `_score` is an implicit column produced by Lance's FTS path; its
+        // numeric type is an upstream contract that may shift on a lancedb
+        // bump. Surface a type mismatch as a clean Error::Backend rather
+        // than the panic that `as_primitive` would raise.
+        let score = column_float32(&batch, "_score")?;
 
         for i in 0..batch.num_rows() {
             hits.push(ChunkHit {
@@ -245,6 +242,28 @@ fn column_string<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArr
     arr.as_any()
         .downcast_ref::<StringArray>()
         .with_context(|| format!("{name} column is not utf8"))
+        .map_err(Error::Backend)
+}
+
+fn column_int32<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int32Array> {
+    let arr = batch
+        .column_by_name(name)
+        .with_context(|| format!("missing {name} column"))
+        .map_err(Error::Backend)?;
+    arr.as_any()
+        .downcast_ref::<Int32Array>()
+        .with_context(|| format!("{name} column is not int32"))
+        .map_err(Error::Backend)
+}
+
+fn column_float32<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Float32Array> {
+    let arr = batch
+        .column_by_name(name)
+        .with_context(|| format!("missing {name} column"))
+        .map_err(Error::Backend)?;
+    arr.as_any()
+        .downcast_ref::<Float32Array>()
+        .with_context(|| format!("{name} column is not float32"))
         .map_err(Error::Backend)
 }
 

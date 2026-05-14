@@ -48,6 +48,14 @@ pub trait Index: Send + Sync {
 
     /// Append/upsert a batch of chunks. Phase 8 wires this to incremental
     /// reindex; Phase 1 just appends.
+    ///
+    /// **Cost note**: backends are permitted to do per-call index
+    /// maintenance (e.g. the LanceDB backend rebuilds the FTS index on the
+    /// `text` column with `.replace(true)`), so the cost can be O(rows) per
+    /// invocation. Callers SHOULD batch a logical indexing run into a
+    /// single `upsert_chunks` call rather than calling it once per file or
+    /// per small batch. A future `finalize`/`compact` split can move the
+    /// index rebuild out of the hot path; until then, batch up-front.
     async fn upsert_chunks(&self, batches: Vec<RecordBatch>) -> Result<()>;
 
     /// Tombstone all chunks for a source path. Phase 8 wires deletion;

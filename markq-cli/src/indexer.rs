@@ -38,6 +38,12 @@ pub async fn run_index<I: Index>(idx: &I, root: &Path) -> Result<IndexReport> {
     let entries: Vec<_> = WalkDir::new(&root)
         .follow_links(false)
         .into_iter()
+        // Skip hidden directories (`.git`, `.venv`, …) and tooling caches
+        // (`node_modules`, `target`). Without this, indexing a repo root
+        // pulls in vendored READMEs and the index balloons with content
+        // the user never meant to retrieve. `WalkDir::filter_entry` prunes
+        // whole subtrees, so a hidden dir doesn't even get descended into.
+        .filter_entry(|e| !is_excluded(e))
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("md"))
@@ -108,7 +114,14 @@ fn build_file_rows(path: &Path, root: &Path) -> Result<FileRows> {
     let chunk_rows = chunks
         .into_iter()
         .map(|c| {
+            // Identity = (uri, content_hash, chunk_index). Two distinct files
+            // with identical content (duplicated READMEs in a monorepo,
+            // vendored notes, generated docs) must not collide on id; once
+            // Phase 8 turns upsert into a real merge-on-id, a collision
+            // would let one file overwrite another's chunk text.
             let mut h = blake3::Hasher::new();
+            h.update(uri.as_bytes());
+            h.update(&[0u8]); // separator so prefix collisions are impossible
             h.update(content_hash.as_bytes());
             h.update(&(c.index as u32).to_le_bytes());
             ChunkRow {
@@ -127,6 +140,25 @@ fn build_file_rows(path: &Path, root: &Path) -> Result<FileRows> {
         mtime_nanos,
         chunks: chunk_rows,
     })
+}
+
+/// True for entries that should be pruned from the walk. Always permit the
+/// root itself (`depth == 0`) so `markq index .markq-test/` still works.
+fn is_excluded(e: &walkdir::DirEntry) -> bool {
+    if e.depth() == 0 {
+        return false;
+    }
+    let name = match e.file_name().to_str() {
+        Some(n) => n,
+        None => return false,
+    };
+    // Hidden (dotfiles / dotdirs). `.` and `..` never appear here — WalkDir
+    // doesn't emit them.
+    if name.starts_with('.') {
+        return true;
+    }
+    // Common tooling caches that aren't dot-prefixed.
+    matches!(name, "node_modules" | "target")
 }
 
 fn file_mtime_nanos(path: &Path) -> Result<i64> {
