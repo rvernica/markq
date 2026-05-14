@@ -12,8 +12,15 @@ specifically:
 - Inspecting fragments, indices, or storage statistics.
 - Round-tripping to pandas / NumPy for ML work.
 
-All output below is from real runs against the current dataset (zero rows;
-real data lands once `markq index` is functional).
+All output below was captured against the default dataset after indexing
+this repo's `README.md`. Reproduce it with:
+
+```sh
+markq index README.md
+```
+
+That populates 8 chunks with NULL embeddings (vector embeddings land once
+`markq embed` is functional) and builds the FTS inverted index on `text`.
 
 ## Prerequisites
 
@@ -23,14 +30,18 @@ uv run --with pylance --with pyarrow python
 uv run --with pylance --with pyarrow python -c '...'
 ```
 
+Add `--with pandas`, `--with polars`, or `--with datafusion` for the
+sections below that use those libraries; `uv` only installs what you
+declare per invocation.
+
 Pylance is currently `4.0.x`; markq pins lancedb-rust to `0.27.2`, which
 embeds the same Lance file format (`2.0`).
 
 ## Open the dataset
 
 ```python
-import lance
-ds = lance.dataset("/home/vernica/.markq/chunks.lance")
+import os, lance
+ds = lance.dataset(os.path.expanduser("~/.markq/chunks.lance"))
 print("uri:           ", ds.uri)
 print("version:       ", ds.version)
 print("latest_version:", ds.latest_version)
@@ -38,32 +49,32 @@ print("count_rows:    ", ds.count_rows())
 ```
 
 ```
-uri:            /home/vernica/.markq/chunks.lance
-version:        2
-latest_version: 2
-count_rows:     0
+uri:            /home/user/.markq/chunks.lance
+version:        4
+latest_version: 4
+count_rows:     8
 ```
 
-`version` increments on every write commit. The fresh dataset has two commits
-— one for `create_table`, one for the `update_config` that wrote the markq
-metadata.
+`version` increments on every write commit. After a fresh init + one
+`markq index README.md` you'll see four commits: two for `create_table` +
+metadata `update_config`, then two more for the append + FTS index build.
 
 ## Read the markq metadata (the headline payoff over DuckDB)
 
 ```python
-import lance, json
-ds = lance.dataset("/home/vernica/.markq/chunks.lance")
+import os, lance, json
+ds = lance.dataset(os.path.expanduser("~/.markq/chunks.lance"))
 print(json.dumps(ds.config(), indent=2))
 ```
 
 ```json
 {
-  "markq.lance_file_format_version": "2.0",
+  "lance.auto_cleanup.older_than": "14days",
   "markq.lance_manifest_version": "1",
-  "markq.lancedb_crate_version": "0.27.2",
   "markq.schema_version": "1",
+  "markq.lancedb_crate_version": "0.27.2",
   "lance.auto_cleanup.interval": "20",
-  "lance.auto_cleanup.older_than": "14days"
+  "markq.lance_file_format_version": "2.0"
 }
 ```
 
@@ -76,8 +87,8 @@ going through the binary.
 ## Inspect the schema
 
 ```python
-import lance
-ds = lance.dataset("/home/vernica/.markq/chunks.lance")
+import os, lance
+ds = lance.dataset(os.path.expanduser("~/.markq/chunks.lance"))
 print(ds.schema)
 ```
 
@@ -107,22 +118,41 @@ under markq because we put everything in `config()` instead.
 ### As an Arrow Table
 
 ```python
-import lance
-ds = lance.dataset("/home/vernica/.markq/chunks.lance")
+import os, lance
+ds = lance.dataset(os.path.expanduser("~/.markq/chunks.lance"))
 tbl = ds.to_table()
-print(type(tbl).__name__)   # pyarrow.Table
+print(type(tbl).__name__)
 print(tbl.num_rows, "rows,", tbl.num_columns, "columns")
 ```
 
 ```
 Table
-0 rows, 12 columns
+8 rows, 12 columns
 ```
 
 ### As a pandas DataFrame
 
+Run with `uv run --with pylance --with pyarrow --with pandas python`.
+
 ```python
+import os, lance
+ds = lance.dataset(os.path.expanduser("~/.markq/chunks.lance"))
 df = ds.to_table().to_pandas()
+print(df.shape)
+print(df[["path", "chunk_index"]].head())
+```
+
+```
+(8, 12)
+                        path  chunk_index
+0  /path/to/markq/README.md            0
+1  /path/to/markq/README.md            1
+2  /path/to/markq/README.md            2
+3  /path/to/markq/README.md            3
+4  /path/to/markq/README.md            4
+```
+
+```python
 print(df.dtypes)
 ```
 
@@ -136,7 +166,7 @@ mtime              int64
 chunk_index        int32
 text                 str
 tokens             int32
-embedding         object   # NumPy array per row, shape (1024,)
+embedding         object   # NumPy array per row, shape (1024,) — currently None
 context_id           str
 schema_version     int32
 ```
@@ -148,22 +178,27 @@ embeddings are populated.
 ### Projection and filter (push-down to Lance)
 
 ```python
+import os, lance
+ds = lance.dataset(os.path.expanduser("~/.markq/chunks.lance"))
 tbl = ds.scanner(
     columns=["path", "chunk_index", "text"],
     filter="collection = 'default'",
 ).to_table()
-print(tbl)
+print(tbl.num_rows, "rows")
+print(tbl.slice(0, 2))
 ```
 
 ```
+8 rows
 pyarrow.Table
 path: string not null
 chunk_index: int32 not null
 text: string not null
 ----
-path: []
-chunk_index: []
-text: []
+path: [["/path/to/markq/README.md","/path/to/markq/README.md"]]
+chunk_index: [[0,1]]
+text: [["# markq\n\n`markq` (mark[down] + q[uery]) is a local-first Rust CLI ...",
+        "`markq` (mark[down] + q[uery]) is a local-first Rust CLI for indexing a\nfolder of markdown and ans..."]]
 ```
 
 The filter is parsed by Lance and pushed down — no full scan unless
@@ -174,26 +209,23 @@ necessary. Filter expression syntax is SQL-like (DataFusion).
 Pylance exposes DataFusion under `ds.sql(...)`:
 
 ```python
-import lance
-ds = lance.dataset("/home/vernica/.markq/chunks.lance")
+import os, lance
+ds = lance.dataset(os.path.expanduser("~/.markq/chunks.lance"))
 reader = (
     ds.sql("SELECT collection, COUNT(*) AS n FROM dataset GROUP BY 1")
       .build()
       .to_stream_reader()
 )
-print("schema:", reader.schema)
 print(reader.read_all())
 ```
 
 ```
-schema: collection: string not null
-n: int64 not null
 pyarrow.Table
 collection: string not null
 n: int64 not null
 ----
-collection: []
-n: []
+collection: [["default"]]
+n: [[8]]
 ```
 
 In an `ds.sql(...)` query the dataset is bound as the table name `dataset`.
@@ -205,28 +237,34 @@ DataFusion the markq Rust crate uses internally.
 Lance keeps every commit. `lance.dataset(uri, version=N)` opens a snapshot:
 
 ```python
-import lance
-for v in [1, 2]:
-    ds_v = lance.dataset("/home/vernica/.markq/chunks.lance", version=v)
+import os, lance
+uri = os.path.expanduser("~/.markq/chunks.lance")
+for v in [1, 2, 3, 4]:
+    ds_v = lance.dataset(uri, version=v)
     print(f"version={ds_v.version} rows={ds_v.count_rows()}")
 ```
 
 ```
 version=1 rows=0
 version=2 rows=0
+version=3 rows=8
+version=4 rows=8
 ```
 
 Or list versions with timestamps:
 
 ```python
-ds = lance.dataset("/home/vernica/.markq/chunks.lance")
+import os, lance
+ds = lance.dataset(os.path.expanduser("~/.markq/chunks.lance"))
 for v in ds.versions():
-    print(v["version"], v["timestamp"], "rows=", v["metadata"]["total_rows"])
+    print(v["version"], v["timestamp"], "rows=", v["metadata"].get("total_rows", "?"))
 ```
 
 ```
 1 2026-05-05 10:09:30.480130 rows= 0
 2 2026-05-05 10:09:30.481256 rows= 0
+3 2026-05-13 19:19:28.746165 rows= 8
+4 2026-05-13 19:19:28.759371 rows= 8
 ```
 
 This is Lance's headline storage feature: zero-copy versioning of your data
@@ -235,16 +273,16 @@ without needing extra infrastructure.
 ## Statistics and storage layout
 
 ```python
-import lance, json
-ds = lance.dataset("/home/vernica/.markq/chunks.lance")
+import os, lance, json
+ds = lance.dataset(os.path.expanduser("~/.markq/chunks.lance"))
 print(json.dumps(ds.stats.dataset_stats(), indent=2, default=str))
 ```
 
 ```
 {
   "num_deleted_rows": 0,
-  "num_fragments": 0,
-  "num_small_files": 0
+  "num_fragments": 1,
+  "num_small_files": 1
 }
 ```
 
@@ -253,24 +291,24 @@ These three numbers drive `markq compact`'s heuristic: when
 rows, run Lance compaction.
 
 ```python
-print("fragments:    ", ds.get_fragments())
-print("indices:      ", ds.list_indices())
-print("tags:         ", ds.tags.list())
+print("fragments:", len(ds.get_fragments()))
+print("indices: ", ds.list_indices())
+print("tags:    ", ds.tags.list())
 ```
 
 ```
-fragments:     []
-indices:       []
-tags:          {}
+fragments: 1
+indices:  [{'name': 'text_idx', 'type': 'Inverted', 'uuid': '…', 'fields': ['text'], 'version': 3, 'fragment_ids': {0}, 'base_id': None}]
+tags:     {}
 ```
 
-`list_indices()` will populate once the FTS and HNSW vector indexes are
-built.
+The `text_idx` Inverted index is what `markq search` (BM25) hits. An HNSW
+index over `embedding` will appear here once `markq embed` is wired up.
 
 ## Vector search
 
-The API shape, for reference — none of these run yet because the dataset
-has no embeddings:
+The API shape, for reference — none of these run yet because the
+`embedding` column is all NULL:
 
 ```python
 # Once `markq embed` has populated the embedding column and built the index:
@@ -296,23 +334,22 @@ pyarrow.dataset.Dataset)` is `True`). Two notable consumers:
 
 ### Polars (lazy DataFrame, predicate / projection pushdown)
 
+Run with `uv run --with pylance --with pyarrow --with polars python`.
+
 ```python
-import lance, polars as pl
-ds = lance.dataset("/home/vernica/.markq/chunks.lance")
+import os, lance, polars as pl
+ds = lance.dataset(os.path.expanduser("~/.markq/chunks.lance"))
 df = (
     pl.scan_pyarrow_dataset(ds)
       .filter(pl.col("collection") == "default")
       .select("path", "chunk_index", "text")
       .collect()
 )
-print(df)
+print(df.shape)
 ```
 
 ```
-shape: (0, 3)
-┌──────┬─────────────┬──────┐
-│ path ┆ chunk_index ┆ text │
-└──────┴─────────────┴──────┘
+(8, 3)
 ```
 
 Polars 1.40 has no `pl.read_lance`; the bridge is `scan_pyarrow_dataset(...)`.
@@ -320,10 +357,30 @@ The filter and column projection are pushed down into Lance — no full scan.
 
 ### DataFusion-Python (Rust SQL engine bound from Python)
 
+Run with `uv run --with pylance --with datafusion python`. The
+`register_dataset` path against a Lance dataset currently errors on
+anything non-trivial — even a plain aggregate fails:
+
 ```python
-import datafusion, lance
+import os, datafusion, lance
 ctx = datafusion.SessionContext()
-ctx.register_dataset("chunks", lance.dataset("/home/vernica/.markq/chunks.lance"))
+ctx.register_dataset("chunks", lance.dataset(os.path.expanduser("~/.markq/chunks.lance")))
+ctx.sql("SELECT collection, COUNT(*) AS n FROM chunks GROUP BY 1").show()
+```
+
+```
+DataFusion error: External error: TypeError: LanceFragment.scanner() takes 1 positional argument but 2 positional arguments (and 3 keyword-only arguments) were given
+```
+
+Upstream signature drift between `datafusion-python` and `pylance`. The
+working pattern today is to materialize to Arrow first and register that
+as a view:
+
+```python
+import os, datafusion, lance
+ctx = datafusion.SessionContext()
+ds = lance.dataset(os.path.expanduser("~/.markq/chunks.lance"))
+ctx.register_view("chunks", ctx.from_arrow(ds.to_table()))
 ctx.sql("SELECT collection, COUNT(*) AS n FROM chunks GROUP BY 1").show()
 ```
 
@@ -331,18 +388,8 @@ ctx.sql("SELECT collection, COUNT(*) AS n FROM chunks GROUP BY 1").show()
 +------------+---+
 | collection | n |
 +------------+---+
+| default    | 8 |
 +------------+---+
-```
-
-Same DataFusion engine the Rust crate uses internally — `register_dataset`
-hands it the Lance `TableProvider` from `lance-datafusion`. Aggregates and
-`DESCRIBE` work; filter pushdown through this path currently errors
-(`get_fragments() does not support filter yet` upstream), so for filtered
-SQL materialize to Arrow first:
-
-```python
-ctx.register_view("chunks_arrow", ctx.from_arrow(ds.to_table()))
-ctx.sql("SELECT path FROM chunks_arrow WHERE collection = 'default'").show()
 ```
 
 There is **no off-the-shelf DataFusion CLI binary** that reads Lance —
@@ -365,27 +412,27 @@ NumPy. Building the dataset is markq's job.
 ```sh
 # Schema
 uv run --with pylance python -c "
-import lance
-print(lance.dataset('/home/vernica/.markq/chunks.lance').schema)
+import os, lance
+print(lance.dataset(os.path.expanduser('~/.markq/chunks.lance')).schema)
 "
 
 # markq metadata
 uv run --with pylance python -c "
-import lance, json
-print(json.dumps(lance.dataset('/home/vernica/.markq/chunks.lance').config(), indent=2))
+import os, lance, json
+print(json.dumps(lance.dataset(os.path.expanduser('~/.markq/chunks.lance')).config(), indent=2))
 "
 
 # Row count + version
 uv run --with pylance python -c "
-import lance
-d = lance.dataset('/home/vernica/.markq/chunks.lance')
+import os, lance
+d = lance.dataset(os.path.expanduser('~/.markq/chunks.lance'))
 print(f'version={d.version} rows={d.count_rows()}')
 "
 
 # All rows as a pandas DataFrame
 uv run --with pylance --with pandas python -c "
-import lance
-df = lance.dataset('/home/vernica/.markq/chunks.lance').to_table().to_pandas()
+import os, lance
+df = lance.dataset(os.path.expanduser('~/.markq/chunks.lance')).to_table().to_pandas()
 print(df.head())
 "
 ```

@@ -5,9 +5,13 @@ can run SQL against it from DuckDB without going through the `markq` binary.
 This is the composable-stack payoff that comes from storing chunks as a bare
 Lance dataset rather than an opaque internal index.
 
-All output below is from real runs against the current dataset (zero rows;
-schema and metadata are in place, real chunks land once `markq index`
-becomes functional).
+All output below is from real runs against the default dataset after
+indexing this repo's `README.md` (8 chunks, no embeddings yet — those
+populate once `markq embed` is functional). Reproduce it with:
+
+```sh
+markq index README.md
+```
 
 ## Prerequisites
 
@@ -30,14 +34,15 @@ Install the extension once per DuckDB CLI install:
 
 ## ATTACH the markq database (recommended)
 
+
 LanceDB stores tables as `<db>/<table_name>.lance/`, where `<db>` is a
 directory holding many tables. markq's `<db>` is `~/.markq/`, with a single
-`chunks` table:
+`chunks` table. `ATTACH` needs an absolute path, so expand `~` first:
 
 ```sql
 LOAD lance;
-ATTACH '/home/vernica/.markq' AS m (TYPE lance);
-SHOW TABLES FROM m;
+ATTACH '/home/user/.markq' AS mq (TYPE lance);
+SHOW TABLES FROM mq;
 ```
 
 ```
@@ -48,12 +53,12 @@ SHOW TABLES FROM m;
 └─────────┘
 ```
 
-Once attached, `m.chunks` behaves like a regular DuckDB table.
+Once attached, `mq.chunks` behaves like a regular DuckDB table.
 
 ### Inspect the schema
 
 ```sql
-DESCRIBE m.chunks;
+DESCRIBE mq.chunks;
 ```
 
 ```
@@ -76,12 +81,12 @@ DESCRIBE m.chunks;
 ```
 
 The `embedding` column is a fixed-size 1024-float vector — DuckDB can read it
-natively, no UDF needed.
+natively, no UDF needed. It stays NULL until `markq embed` is functional.
 
 ### Count and select
 
 ```sql
-SELECT COUNT(*) AS rows FROM m.chunks;
+SELECT COUNT(*) AS rows FROM mq.chunks;
 ```
 
 ```
@@ -89,22 +94,58 @@ SELECT COUNT(*) AS rows FROM m.chunks;
 │ rows  │
 │ int64 │
 ├───────┤
-│     0 │
+│     8 │
 └───────┘
 ```
 
 ```sql
-SELECT collection, path, chunk_index FROM m.chunks LIMIT 5;
+SELECT collection, path, chunk_index FROM mq.chunks ORDER BY chunk_index LIMIT 3;
 ```
 
 ```
-┌────────────┬─────────┬─────────────┐
-│ collection │  path   │ chunk_index │
-└────────────┴─────────┴─────────────┘
-        0 rows
+┌────────────┬───────────────────────────┬─────────────┐
+│ collection │           path            │ chunk_index │
+├────────────┼───────────────────────────┼─────────────┤
+│ default    │ /path/to/markq/README.md  │           0 │
+│ default    │ /path/to/markq/README.md  │           1 │
+│ default    │ /path/to/markq/README.md  │           2 │
+└────────────┴───────────────────────────┴─────────────┘
 ```
 
-(Once `markq index` is functional, this query returns real rows.)
+(The `path` column reflects whatever absolute path `markq index` canonicalized
+on your machine.)
+
+### Aggregations
+
+```sql
+SELECT collection, COUNT(*) FROM mq.chunks GROUP BY 1;
+```
+
+```
+┌────────────┬──────────────┐
+│ collection │ count_star() │
+├────────────┼──────────────┤
+│ default    │            8 │
+└────────────┴──────────────┘
+```
+
+```sql
+SELECT path, chunk_index, length(text) AS chars
+FROM mq.chunks
+WHERE embedding IS NULL
+ORDER BY chars DESC
+LIMIT 3;
+```
+
+```
+┌───────────────────────────┬─────────────┬───────┐
+│           path            │ chunk_index │ chars │
+├───────────────────────────┼─────────────┼───────┤
+│ /path/to/markq/README.md  │           1 │  1139 │
+│ /path/to/markq/README.md  │           2 │   899 │
+│ /path/to/markq/README.md  │           3 │   717 │
+└───────────────────────────┴─────────────┴───────┘
+```
 
 ## Function-style scan (alternative)
 
@@ -116,15 +157,19 @@ published extension renames it.
 ```sql
 LOAD lance;
 SELECT id, path, chunk_index
-FROM __lance_scan('/home/vernica/.markq/chunks.lance')
-LIMIT 5;
+FROM __lance_scan('/home/user/.markq/chunks.lance')
+ORDER BY chunk_index
+LIMIT 3;
 ```
 
 ```
-┌─────────┬─────────┬─────────────┐
-│   id    │  path   │ chunk_index │
-└─────────┴─────────┴─────────────┘
-       0 rows
+┌────────────────────────────────────────────────────────────────────┬───────────────────────────┬─────────────┐
+│                                 id                                 │           path            │ chunk_index │
+├────────────────────────────────────────────────────────────────────┼───────────────────────────┼─────────────┤
+│ 9e3a…                                                              │ /path/to/markq/README.md  │           0 │
+│ 62e0…                                                              │ /path/to/markq/README.md  │           1 │
+│ cb74…                                                              │ /path/to/markq/README.md  │           2 │
+└────────────────────────────────────────────────────────────────────┴───────────────────────────┴─────────────┘
 ```
 
 `ATTACH` is preferable for interactive work — it makes joins, `DESCRIBE`, and
@@ -153,13 +198,34 @@ ORDER BY 1;
 └─────────────────────┴──────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Expected shapes:
-- **BM25**: `SELECT * FROM lance_fts('m.chunks', 'text', 'query', false, 10);`
-- **Vector**: `SELECT * FROM lance_vector_search('m.chunks', 'embedding', [0.1, ...], ...);`
-- **Hybrid**: `lance_hybrid_search(...)` with `alpha` weighting BM25 vs vector.
+One gotcha: the optional parameters (`prefilter`, `k`, …) are
+**named-only**. Positional `..., false, 10)` fails to bind even with the
+right types; use `prefilter := false, k := 3` instead.
 
-The exact argument shapes will be confirmed against real data once the index
-is built; for now the function existence is what matters.
+**BM25** works today — `markq index` builds the `text_idx` Inverted index:
+
+```sql
+LOAD lance;
+SELECT chunk_index, _score, substr(text, 1, 60) AS preview
+FROM lance_fts('/home/user/.markq/chunks.lance', 'text', 'lance',
+               prefilter := false, k := 3);
+```
+
+```
+┌─────────────┬────────────┬──────────────────────────────────────────────────────────────────┐
+│ chunk_index │   _score   │                             preview                              │
+├─────────────┼────────────┼──────────────────────────────────────────────────────────────────┤
+│           1 │   1.022264 │ `markq` (mark[down] + q[uery]) is a local-first Rust CLI for     │
+│           5 │  0.9687533 │ A tracked `pre-commit` hook in `.githooks/` runs `cargo fmt      │
+│           6 │ 0.93084234 │ ```sh\ncargo run -q -p markq-cli -- inspect\n```\n\nCreates `~/. │
+└─────────────┴────────────┴──────────────────────────────────────────────────────────────────┘
+```
+
+Scores match `markq search "lance"` exactly — same underlying index.
+
+**Vector** (`lance_vector_search`) and **Hybrid** (`lance_hybrid_search`,
+`alpha` weighting BM25 vs vector) need populated embeddings and an HNSW
+index first; they'll light up once `markq embed` is functional.
 
 ## Lance auto-cleanup config
 
@@ -168,7 +234,7 @@ settings live in the dataset config and are visible via:
 
 ```sql
 LOAD lance;
-SELECT * FROM __lance_show_auto_cleanup('/home/vernica/.markq/chunks.lance');
+SELECT * FROM __lance_show_auto_cleanup('/home/user/.markq/chunks.lance');
 ```
 
 ```
@@ -197,18 +263,18 @@ To read the markq metadata, use pylance instead:
 ```sh
 uv run --with pylance python -c "
 import lance, json
-print(json.dumps(lance.dataset('/home/vernica/.markq/chunks.lance').config(), indent=2))
+print(json.dumps(lance.dataset('$HOME/.markq/chunks.lance').config(), indent=2))
 "
 ```
 
 ```json
 {
-  "markq.lance_file_format_version": "2.0",
+  "lance.auto_cleanup.older_than": "14days",
   "markq.lance_manifest_version": "1",
-  "markq.lancedb_crate_version": "0.27.2",
   "markq.schema_version": "1",
+  "markq.lancedb_crate_version": "0.27.2",
   "lance.auto_cleanup.interval": "20",
-  "lance.auto_cleanup.older_than": "14days"
+  "markq.lance_file_format_version": "2.0"
 }
 ```
 
@@ -219,24 +285,22 @@ mismatches into structured errors. DuckDB is for ad-hoc data exploration.
 
 ```sh
 # Open an interactive DuckDB shell with markq attached.
-~/.duckdb/cli/1.5.0/duckdb -c "
-LOAD lance;
-ATTACH '/home/vernica/.markq' AS m (TYPE lance);
-" -interactive
+# Use -cmd (runs before stdin) — `-c` would execute the SQL and exit.
+~/.duckdb/cli/1.5.0/duckdb -cmd "LOAD lance; ATTACH '$HOME/.markq' AS mq (TYPE lance);"
 
 # Count chunks per collection.
 ~/.duckdb/cli/1.5.0/duckdb -c "
 LOAD lance;
-ATTACH '/home/vernica/.markq' AS m (TYPE lance);
-SELECT collection, COUNT(*) FROM m.chunks GROUP BY 1 ORDER BY 2 DESC;
+ATTACH '$HOME/.markq' AS mq (TYPE lance);
+SELECT collection, COUNT(*) FROM mq.chunks GROUP BY 1 ORDER BY 2 DESC;
 "
 
 # Find the longest unembedded chunks.
 ~/.duckdb/cli/1.5.0/duckdb -c "
 LOAD lance;
-ATTACH '/home/vernica/.markq' AS m (TYPE lance);
+ATTACH '$HOME/.markq' AS mq (TYPE lance);
 SELECT path, chunk_index, length(text) AS chars
-FROM m.chunks
+FROM mq.chunks
 WHERE embedding IS NULL
 ORDER BY chars DESC
 LIMIT 10;
