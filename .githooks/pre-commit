@@ -33,10 +33,27 @@ fi
 # Derive the edition from the workspace Cargo.toml so an edition bump (2021 ->
 # 2024) doesn't silently desync from `cargo fmt`. Falls back to 2021 if the
 # field isn't found.
+#
+# Notes on portability/correctness:
+# - `[[:space:]]` instead of `\s` so BSD grep on macOS (in-scope for Metal
+#   builds) doesn't take the regex literally and silently fall back.
+# - Anchor the path to the worktree root so the hook works regardless of
+#   the cwd it was invoked from.
+# - Read only the `[workspace.package]` section to avoid picking up a
+#   stray per-crate `edition = "..."` that might land above it later.
+root="$(git rev-parse --show-toplevel)"
 edition="$(
-    grep -m1 -E '^edition\s*=' Cargo.toml 2>/dev/null \
-        | sed -E 's/.*"([^"]+)".*/\1/' \
-        || true
+    awk '
+        /^\[workspace\.package\]/ { in_section = 1; next }
+        /^\[/                     { in_section = 0 }
+        in_section && /^edition[[:space:]]*=/ {
+            match($0, /"[^"]+"/)
+            if (RSTART > 0) {
+                print substr($0, RSTART + 1, RLENGTH - 2)
+                exit
+            }
+        }
+    ' "$root/Cargo.toml" 2>/dev/null || true
 )"
 edition="${edition:-2021}"
 
