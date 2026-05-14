@@ -16,7 +16,7 @@ use lance_index::scalar::FullTextSearchQuery;
 use lancedb::index::scalar::FtsIndexBuilder;
 use lancedb::index::Index as LanceIndexKind;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
-use lancedb::{Connection, Table};
+use lancedb::Table;
 use markq_core::{
     chunk_arrow_schema, ChunkColumn, ChunkHit, DatasetMetadata, Error, Index, Result,
     EMBEDDING_DIM_DEFAULT, KEY_EMBEDDER_DIM, KEY_EMBEDDER_MODEL, KEY_LANCEDB_CRATE_VERSION,
@@ -30,7 +30,6 @@ use tracing::{debug, info};
 pub const LANCEDB_CRATE_VERSION: &str = "0.27.2";
 
 pub struct LanceIndex {
-    conn: Connection,
     table: Table,
     /// The dataset directory (e.g. `~/.markq/chunks.lance`). Held so
     /// `markq inspect` can print it.
@@ -112,7 +111,6 @@ impl LanceIndex {
         };
 
         Ok(LanceIndex {
-            conn,
             table,
             path: dataset_path.to_path_buf(),
             schema,
@@ -122,12 +120,6 @@ impl LanceIndex {
     /// Path the dataset lives at on disk.
     pub fn path(&self) -> &Path {
         &self.path
-    }
-
-    /// The underlying `lancedb::Connection`. Exposed for ad-hoc admin work
-    /// (e.g. `markq compact`) without leaking the rest of the table API.
-    pub fn connection(&self) -> &Connection {
-        &self.conn
     }
 }
 
@@ -277,18 +269,29 @@ async fn read_metadata(table: &Table) -> Result<DatasetMetadata> {
             .ok_or(Error::MetadataMissingKey(key))
     }
 
-    let schema_version: u32 = require(config, KEY_SCHEMA_VERSION)?
-        .parse()
-        .map_err(|_| Error::MetadataMissingKey(KEY_SCHEMA_VERSION))?;
-    let lance_manifest_version: u64 = require(config, KEY_LANCE_MANIFEST_VERSION)?
-        .parse()
-        .map_err(|_| Error::MetadataMissingKey(KEY_LANCE_MANIFEST_VERSION))?;
+    fn parse_int<T: std::str::FromStr<Err = std::num::ParseIntError>>(
+        raw: &str,
+        key: &'static str,
+    ) -> Result<T> {
+        raw.parse().map_err(|source| Error::MetadataInvalidValue {
+            key,
+            value: raw.to_string(),
+            source,
+        })
+    }
+
+    let schema_version: u32 = parse_int(require(config, KEY_SCHEMA_VERSION)?, KEY_SCHEMA_VERSION)?;
+    let lance_manifest_version: u64 = parse_int(
+        require(config, KEY_LANCE_MANIFEST_VERSION)?,
+        KEY_LANCE_MANIFEST_VERSION,
+    )?;
     let lance_file_format_version = require(config, KEY_LANCE_FILE_FORMAT_VERSION)?.to_string();
     let lancedb_crate_version = require(config, KEY_LANCEDB_CRATE_VERSION)?.to_string();
     let embedder_model = config.get(KEY_EMBEDDER_MODEL).cloned();
-    let embedder_dim = config
-        .get(KEY_EMBEDDER_DIM)
-        .and_then(|s| s.parse::<u32>().ok());
+    let embedder_dim = match config.get(KEY_EMBEDDER_DIM) {
+        Some(raw) => Some(parse_int(raw, KEY_EMBEDDER_DIM)?),
+        None => None,
+    };
 
     Ok(DatasetMetadata {
         schema_version,
@@ -345,6 +348,14 @@ impl Index for LanceIndex {
         // wires the actual incremental-reindex tombstone path. For
         // this is enough to satisfy the trait surface and the
         // contract test.
+        //
+        // SAFETY ASSUMPTION: `path` is a filesystem path produced by markq's
+        // own indexer (canonicalized; no control bytes). The hand-rolled
+        // single-quote doubling matches Lance/DataFusion's expression-parser
+        // escape rules, but it is not a general SQL sanitizer. If a future
+        // caller ever threads user-controlled strings through this method
+        // (e.g. a `markq delete <pattern>` command), swap to a parameter-
+        // bound delete API rather than extending this escape.
         let escaped = path.replace('\'', "''");
         let predicate = format!("path = '{escaped}'");
         let res = self

@@ -5,8 +5,11 @@
 //! Gated by the `test-harness` feature so the contract doesn't bloat
 //! release binaries.
 
+use arrow_schema::DataType;
+
 use crate::index::Index;
 use crate::metadata::SCHEMA_VERSION;
+use crate::schema::ChunkColumn;
 
 /// Run the full contract suite against a freshly-opened backend.
 /// Caller is responsible for tearing down the underlying storage.
@@ -37,7 +40,17 @@ pub async fn run_contract<I: Index>(idx: &I) {
         .await
         .expect("bm25")
         .is_empty());
-    let dummy = vec![0.0f32; 4];
+    // Size the dummy embedding from the schema rather than hardcoding it —
+    // once wires the real KNN path, a mis-sized vector would start
+    // failing here exactly when the contract should be lighting up.
+    let embedding_field = schema
+        .field_with_name(ChunkColumn::EMBEDDING)
+        .expect("embedding column");
+    let embedding_dim = match embedding_field.data_type() {
+        DataType::FixedSizeList(_, n) => *n as usize,
+        other => panic!("expected FixedSizeList embedding column, got {other:?}"),
+    };
+    let dummy = vec![0.0f32; embedding_dim];
     assert!(idx
         .vector(&dummy, 10, None)
         .await

@@ -23,11 +23,6 @@ struct Cli {
     #[arg(long, global = true)]
     dataset: Option<PathBuf>,
 
-    /// Refuse network calls (model downloads, etc.). Currently parsed but
-    /// not yet enforced — wires up once `hf-hub` model downloads land.
-    #[arg(long, global = true)]
-    offline: bool,
-
     #[command(subcommand)]
     cmd: Command,
 }
