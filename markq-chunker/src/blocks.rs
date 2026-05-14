@@ -41,6 +41,16 @@ impl BlockKind {
     pub fn is_heading(self) -> bool {
         matches!(self, BlockKind::Heading(_))
     }
+
+    /// Blocks the packer must keep whole. When `push_block` coalesces an
+    /// atomic block into a non-atomic predecessor, the merged span is
+    /// promoted to the atomic kind so the packer still treats it as a unit.
+    pub fn is_atomic(self) -> bool {
+        matches!(
+            self,
+            BlockKind::Code | BlockKind::Table | BlockKind::Html | BlockKind::FootnoteDef
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +155,13 @@ fn push_block(out: &mut Vec<Block>, src: &str, kind: BlockKind, start: usize, en
             // Overlapping — extend if the new event reaches further.
             if end > last.end {
                 last.end = end;
+            }
+            // If the incoming kind is atomic and the existing one is not,
+            // promote: the packer relies on `is_atomic` to keep code /
+            // table / HTML / footnote definitions whole, so a paragraph
+            // that swallows an Html event must report as Html.
+            if kind.is_atomic() && !last.kind.is_atomic() {
+                last.kind = kind;
             }
             return;
         }
