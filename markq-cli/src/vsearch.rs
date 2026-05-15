@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use markq_core::Index;
 use markq_index_lance::LanceIndex;
-use markq_inference::{ensure_model, Embedder, KnownModel};
+use markq_inference::{default_n_gpu_layers, ensure_model, Embedder, KnownModel};
 
 use crate::search::{apply_filters, SearchOptions};
 use markq_core::ChunkHit;
@@ -41,11 +41,8 @@ pub async fn run_vsearch(
     }
 
     let model_path = ensure_model(model).await.context("locate embedder model")?;
-    #[cfg(any(feature = "vulkan", feature = "cuda"))]
-    let n_gpu_layers: u32 = 999;
-    #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
-    let n_gpu_layers: u32 = 0;
-    let embedder = Embedder::load(&model_path, n_gpu_layers).context("load embedder")?;
+    let embedder =
+        Embedder::load(&model_path, default_n_gpu_layers()).context("load embedder")?;
 
     let q_vec = embedder
         .embed(query.to_string())

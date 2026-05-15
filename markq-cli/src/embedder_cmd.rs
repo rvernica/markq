@@ -17,7 +17,7 @@ use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch
 use arrow_schema::{DataType, Field};
 use markq_core::ChunkColumn;
 use markq_index_lance::LanceIndex;
-use markq_inference::{ensure_model, Embedder, KnownModel};
+use markq_inference::{default_n_gpu_layers, ensure_model, Embedder, KnownModel};
 use tracing::{info, warn};
 
 /// How many rows to fetch / embed / merge per round-trip. Keeps memory
@@ -37,14 +37,8 @@ pub async fn run_embed(idx: &LanceIndex) -> Result<EmbedReport> {
         .await
         .context("download / locate embedder model")?;
 
-    // GPU offload: same convention as spike 0a — n_gpu_layers=999 means "all"
-    // when built with --features vulkan / cuda; 0 on a CPU build.
-    #[cfg(any(feature = "vulkan", feature = "cuda"))]
-    let n_gpu_layers: u32 = 999;
-    #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
-    let n_gpu_layers: u32 = 0;
-
-    let embedder = Embedder::load(&model_path, n_gpu_layers).context("load embedder")?;
+    let embedder =
+        Embedder::load(&model_path, default_n_gpu_layers()).context("load embedder")?;
     let dim = embedder.dim();
     info!(model = model.id(), dim, "embedder ready");
 
