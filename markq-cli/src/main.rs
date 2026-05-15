@@ -10,7 +10,7 @@ use markq_core::{default_dataset_path, Index};
 use markq_index_lance::LanceIndex;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use markq_cli::{embedder_cmd, indexer, query, search, vsearch};
+use markq_cli::{embed_query, embedder_cmd, indexer, query, search, vsearch};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -34,6 +34,8 @@ enum Command {
     Index(IndexArgs),
     /// Generate embeddings for unembedded rows.
     Embed(EmbedArgs),
+    /// Embed one query string and print the vector as JSON.
+    EmbedQuery(EmbedQueryArgs),
 
     /// Manage collections.
     #[command(subcommand)]
@@ -96,6 +98,11 @@ struct IndexArgs {
 struct EmbedArgs {
     #[arg(short = 'c', long)]
     collection: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct EmbedQueryArgs {
+    query: String,
 }
 
 #[derive(Args, Debug)]
@@ -186,6 +193,7 @@ async fn main() -> Result<()> {
         Command::Index(args) => cmd_index(&dataset_path, &args).await,
         Command::Search(args) => cmd_search(&dataset_path, &args).await,
         Command::Embed(args) => cmd_embed(&dataset_path, &args).await,
+        Command::EmbedQuery(args) => cmd_embed_query(&dataset_path, &args).await,
         Command::Vsearch(args) => cmd_vsearch(&dataset_path, &args).await,
         Command::Query(args) => cmd_query(&dataset_path, &args).await,
 
@@ -240,6 +248,15 @@ async fn cmd_embed(dataset_path: &std::path::Path, args: &EmbedArgs) -> Result<(
         report.rows, report.batches, report.model_id, report.dim,
     );
     Ok(())
+}
+
+async fn cmd_embed_query(
+    dataset_path: &std::path::Path,
+    args: &EmbedQueryArgs,
+) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    embed_query::run_embed_query(dataset_path, &args.query, &mut out).await
 }
 
 async fn cmd_vsearch(dataset_path: &std::path::Path, args: &QueryArgs) -> Result<()> {
