@@ -49,6 +49,84 @@ impl Default for FusionConfig {
     }
 }
 
-pub fn fuse(_lists: &[(&'static str, &[ChunkHit])], _cfg: &FusionConfig) -> Vec<FusedHit> {
-    Vec::new()
+pub fn fuse(lists: &[(&'static str, &[ChunkHit])], cfg: &FusionConfig) -> Vec<FusedHit> {
+    use std::collections::HashMap;
+
+    let mut by_id: HashMap<String, FusedHit> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+
+    for (source, list) in lists {
+        let weight = cfg.weights.get(source).copied().unwrap_or(0.0);
+        for (idx, h) in list.iter().enumerate() {
+            let rank = idx + 1;
+            let rrf_value = weight / (cfg.k as f32 + rank as f32);
+            let bonus = if rank <= cfg.top_rank_bonus.len() {
+                cfg.top_rank_bonus[rank - 1]
+            } else {
+                0.0
+            };
+            let contribution = Contribution {
+                source,
+                rank,
+                weight,
+                rrf_value,
+                bonus,
+            };
+            match by_id.get_mut(&h.id) {
+                Some(existing) => {
+                    existing.final_score += rrf_value + bonus;
+                    existing.contributions.push(contribution);
+                }
+                None => {
+                    order.push(h.id.clone());
+                    by_id.insert(
+                        h.id.clone(),
+                        FusedHit {
+                            hit: h.clone(),
+                            final_score: rrf_value + bonus,
+                            contributions: vec![contribution],
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<FusedHit> = order
+        .into_iter()
+        .map(|id| by_id.remove(&id).expect("seeded above"))
+        .collect();
+
+    out.sort_by(|a, b| {
+        b.final_score
+            .partial_cmp(&a.final_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.hit.id.cmp(&b.hit.id))
+    });
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hit(id: &str) -> ChunkHit {
+        ChunkHit {
+            id: id.to_string(),
+            path: format!("{id}.md"),
+            uri: format!("file:///{id}.md"),
+            chunk_index: 0,
+            text: String::new(),
+            score: 0.0,
+        }
+    }
+
+    #[test]
+    fn single_list_preserves_order() {
+        let lex = vec![hit("a"), hit("b"), hit("c")];
+        let cfg = FusionConfig::default();
+        let fused = fuse(&[("lex", &lex)], &cfg);
+        let ids: Vec<&str> = fused.iter().map(|f| f.hit.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+    }
 }
