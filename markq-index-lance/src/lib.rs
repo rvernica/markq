@@ -15,9 +15,10 @@ use async_trait::async_trait;
 use futures::TryStreamExt;
 use lance_index::scalar::FullTextSearchQuery;
 use lancedb::index::scalar::FtsIndexBuilder;
+use lancedb::index::vector::IvfHnswSqIndexBuilder;
 use lancedb::index::Index as LanceIndexKind;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
-use lancedb::Table;
+use lancedb::{DistanceType, Table};
 use markq_core::{
     chunk_arrow_schema, ChunkColumn, ChunkHit, DatasetMetadata, Error, Index, Result,
     EMBEDDING_DIM_DEFAULT, KEY_EMBEDDER_DIM, KEY_EMBEDDER_MODEL, KEY_LANCEDB_CRATE_VERSION,
@@ -122,6 +123,145 @@ impl LanceIndex {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// On first embed, record `embedder_model` + `embedder_dim` in the
+    /// dataset's user metadata. On subsequent calls, verify the existing
+    /// values match — a mismatch is `Error::EmbedderDimMismatch` (dim) or a
+    /// `Error::Backend` carrying a clean message (model id).
+    ///
+    /// Returns `true` if this call wrote the metadata (first time), `false`
+    /// if validation against existing metadata succeeded.
+    pub async fn validate_or_record_embedder(&self, model_id: &str, dim: u32) -> Result<bool> {
+        let native = self
+            .table
+            .as_native()
+            .context("native table required to update embedder metadata")
+            .map_err(Error::Backend)?;
+
+        let manifest = native
+            .manifest()
+            .await
+            .context("read manifest")
+            .map_err(Error::Backend)?;
+        let config = &manifest.config;
+
+        match (
+            config.get(KEY_EMBEDDER_MODEL),
+            config.get(KEY_EMBEDDER_DIM),
+        ) {
+            (Some(existing_model), Some(existing_dim_raw)) => {
+                let existing_dim: u32 = existing_dim_raw.parse().map_err(|source| {
+                    Error::MetadataInvalidValue {
+                        key: KEY_EMBEDDER_DIM,
+                        value: existing_dim_raw.clone(),
+                        source,
+                    }
+                })?;
+                if existing_dim != dim {
+                    return Err(Error::EmbedderDimMismatch {
+                        dataset: existing_dim,
+                        embedder: dim,
+                    });
+                }
+                if existing_model != model_id {
+                    return Err(Error::Backend(anyhow::anyhow!(
+                        "embedder model mismatch: dataset built with {existing_model}, current embedder {model_id}"
+                    )));
+                }
+                Ok(false)
+            }
+            (None, None) => {
+                native
+                    .update_config(vec![
+                        (KEY_EMBEDDER_MODEL.to_string(), model_id.to_string()),
+                        (KEY_EMBEDDER_DIM.to_string(), dim.to_string()),
+                    ])
+                    .await
+                    .context("write embedder metadata")
+                    .map_err(Error::Backend)?;
+                Ok(true)
+            }
+            _ => Err(Error::Backend(anyhow::anyhow!(
+                "embedder metadata is partial — exactly one of {KEY_EMBEDDER_MODEL}/{KEY_EMBEDDER_DIM} is set; this should not happen"
+            ))),
+        }
+    }
+
+    /// Stream rows whose `embedding` column is null. Returns `(id, text)`
+    /// pairs. The full RecordBatch is also returned so callers can pass it
+    /// straight back through `merge_insert` after filling in `embedding` —
+    /// avoiding a second scan.
+    ///
+    /// `limit` caps the rows returned in one call; `None` means "all
+    /// remaining unembedded rows".
+    pub async fn scan_unembedded(&self, limit: Option<usize>) -> Result<Vec<RecordBatch>> {
+        let mut q = self
+            .table
+            .query()
+            .only_if(format!("{} IS NULL", ChunkColumn::EMBEDDING));
+        if let Some(l) = limit {
+            q = q.limit(l);
+        }
+        let mut stream = q
+            .execute()
+            .await
+            .context("execute unembedded scan")
+            .map_err(Error::Backend)?;
+        let mut out = Vec::new();
+        while let Some(batch) = stream
+            .try_next()
+            .await
+            .context("read unembedded batch")
+            .map_err(Error::Backend)?
+        {
+            out.push(batch);
+        }
+        Ok(out)
+    }
+
+    /// Merge updated rows (same `id`, now with `embedding` populated) back
+    /// into the table. After a successful merge we (re)build the vector
+    /// index so the next `vector()` call has fresh state.
+    pub async fn apply_embeddings(&self, updated: Vec<RecordBatch>) -> Result<u64> {
+        if updated.is_empty() {
+            return Ok(0);
+        }
+        let row_count: u64 = updated.iter().map(|b| b.num_rows() as u64).sum();
+        let schema = self.schema.clone();
+        let reader: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+            updated.into_iter().map(Ok),
+            schema,
+        ));
+        let mut merge = self.table.merge_insert(&[ChunkColumn::ID]);
+        merge.when_matched_update_all(None);
+        merge
+            .execute(reader)
+            .await
+            .context("merge_insert embeddings")
+            .map_err(Error::Backend)?;
+
+        ensure_vector_index(&self.table).await?;
+        Ok(row_count)
+    }
+}
+
+async fn ensure_vector_index(table: &Table) -> Result<()> {
+    // IvfHnswSq with Cosine matches the `vector()` query path. Like the FTS
+    // path, we create-or-replace per call; will gate behind
+    // fragmentation thresholds. Defaults (m=20, ef_construction=300) match
+    // upstream Lance defaults; only the distance type is overridden.
+    let builder = IvfHnswSqIndexBuilder::default().distance_type(DistanceType::Cosine);
+    table
+        .create_index(
+            &[ChunkColumn::EMBEDDING],
+            LanceIndexKind::IvfHnswSq(builder),
+        )
+        .replace(true)
+        .execute()
+        .await
+        .context("create vector index on embedding")
+        .map_err(Error::Backend)?;
+    Ok(())
 }
 
 async fn write_initial_metadata(table: &Table) -> Result<()> {
@@ -228,6 +368,61 @@ async fn bm25_search(table: &Table, query: &str, k: usize) -> Result<Vec<ChunkHi
                 chunk_index: chunk_index.value(i),
                 text: text.value(i).to_string(),
                 score: score.value(i),
+            });
+        }
+    }
+    Ok(hits)
+}
+
+async fn vector_search(table: &Table, embedding: &[f32], k: usize) -> Result<Vec<ChunkHit>> {
+    let query = table
+        .query()
+        .nearest_to(embedding.to_vec())
+        .context("nearest_to(query vector)")
+        .map_err(Error::Backend)?
+        .distance_type(DistanceType::Cosine)
+        .select(Select::Columns(vec![
+            ChunkColumn::ID.to_string(),
+            ChunkColumn::PATH.to_string(),
+            ChunkColumn::URI.to_string(),
+            ChunkColumn::CHUNK_INDEX.to_string(),
+            ChunkColumn::TEXT.to_string(),
+            "_distance".to_string(),
+        ]))
+        .limit(k);
+
+    let mut stream = query
+        .execute()
+        .await
+        .context("execute vector query")
+        .map_err(Error::Backend)?;
+
+    let mut hits = Vec::new();
+    while let Some(batch) = stream
+        .try_next()
+        .await
+        .context("read vector result batch")
+        .map_err(Error::Backend)?
+    {
+        let id = column_string(&batch, ChunkColumn::ID)?;
+        let path = column_string(&batch, ChunkColumn::PATH)?;
+        let uri = column_string(&batch, ChunkColumn::URI)?;
+        let chunk_index = column_int32(&batch, ChunkColumn::CHUNK_INDEX)?;
+        let text = column_string(&batch, ChunkColumn::TEXT)?;
+        // Lance emits `_distance` for vector queries; cosine distance is in
+        // [0, 2]. Convert to a similarity in [-1, 1] (`1 - distance`) so
+        // higher-is-better matches the BM25 convention and downstream RRF
+        // can treat scores uniformly.
+        let dist = column_float32(&batch, "_distance")?;
+
+        for i in 0..batch.num_rows() {
+            hits.push(ChunkHit {
+                id: id.value(i).to_string(),
+                path: path.value(i).to_string(),
+                uri: uri.value(i).to_string(),
+                chunk_index: chunk_index.value(i),
+                text: text.value(i).to_string(),
+                score: 1.0 - dist.value(i),
             });
         }
     }
@@ -412,12 +607,17 @@ impl Index for LanceIndex {
 
     async fn vector(
         &self,
-        _embedding: &[f32],
-        _k: usize,
+        embedding: &[f32],
+        k: usize,
         _collection: Option<&str>,
     ) -> Result<Vec<ChunkHit>> {
-        // Vector retrieval lands in .
-        Ok(Vec::new())
+        if embedding.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.count_rows().await? == 0 {
+            return Ok(Vec::new());
+        }
+        vector_search(&self.table, embedding, k).await
     }
 
     async fn hybrid(
@@ -440,6 +640,223 @@ impl Index for LanceIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use arrow_array::{
+        new_null_array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, Int64Array,
+        StringArray,
+    };
+    use arrow_schema::{DataType, Field};
+
+    #[tokio::test]
+    async fn validate_or_record_embedder_first_then_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chunks.lance");
+        // Build with a small explicit dim so the round-trip test doesn't
+        // need a 1024-wide allocation.
+        let idx = LanceIndex::open_or_create_with_dim(&path, 8).await.unwrap();
+
+        // First call records the metadata.
+        let wrote = idx
+            .validate_or_record_embedder("test/embedder-A", 8)
+            .await
+            .unwrap();
+        assert!(wrote, "first call should write metadata");
+
+        // Same model + dim → ok, no-op.
+        let wrote2 = idx
+            .validate_or_record_embedder("test/embedder-A", 8)
+            .await
+            .unwrap();
+        assert!(!wrote2, "second call with matching args should be a no-op");
+
+        // Different dim → typed dim-mismatch error.
+        let err = idx
+            .validate_or_record_embedder("test/embedder-A", 16)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::EmbedderDimMismatch {
+                    dataset: 8,
+                    embedder: 16
+                }
+            ),
+            "expected EmbedderDimMismatch, got: {err:?}"
+        );
+
+        // Same dim, different model id → Error::Backend with a clean message
+        // (a separate code path from EmbedderDimMismatch — silently accepting
+        // would let a Mean-pooled and a Last-pooled embedder co-mingle).
+        let err = idx
+            .validate_or_record_embedder("test/embedder-B", 8)
+            .await
+            .unwrap_err();
+        match err {
+            Error::Backend(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("embedder model mismatch"),
+                    "expected model-mismatch message, got: {msg}"
+                );
+                assert!(msg.contains("test/embedder-A"));
+                assert!(msg.contains("test/embedder-B"));
+            }
+            other => panic!("expected Error::Backend for model-id mismatch, got: {other:?}"),
+        }
+    }
+
+    /// Build a single-row batch with explicit f32 embedding, merge it into a
+    /// fresh dataset, and confirm `vector()` returns the row with a cosine
+    /// similarity in the expected direction.
+    #[tokio::test]
+    async fn vector_round_trip_small_dim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chunks.lance");
+        let idx = LanceIndex::open_or_create_with_dim(&path, 4).await.unwrap();
+        let schema = idx.arrow_schema();
+
+        // Two rows with orthogonal-ish unit-length embeddings.
+        let ids = StringArray::from(vec!["a", "b"]);
+        let collections = StringArray::from(vec!["default", "default"]);
+        let uris = StringArray::from(vec!["markq://default/a.md", "markq://default/b.md"]);
+        let paths = StringArray::from(vec!["a.md", "b.md"]);
+        let hashes = StringArray::from(vec!["hash-a", "hash-b"]);
+        let mtimes = Int64Array::from(vec![0i64, 0]);
+        let chunk_idx = Int32Array::from(vec![0i32, 0]);
+        let texts = StringArray::from(vec!["alpha", "bravo"]);
+        let tokens = Int32Array::from(vec![Some(1i32), Some(1)]);
+        let ctx_ids: arrow_array::ArrayRef =
+            Arc::new(StringArray::from(vec![None as Option<&str>, None]));
+        let schema_versions = Int32Array::from(vec![SCHEMA_VERSION as i32; 2]);
+
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let values = Float32Array::from(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        let embedding = FixedSizeListArray::try_new(item, 4, Arc::new(values), None).unwrap();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(ids),
+                Arc::new(collections),
+                Arc::new(uris),
+                Arc::new(paths),
+                Arc::new(hashes),
+                Arc::new(mtimes),
+                Arc::new(chunk_idx),
+                Arc::new(texts),
+                Arc::new(tokens),
+                Arc::new(embedding),
+                ctx_ids,
+                Arc::new(schema_versions),
+            ],
+        )
+        .unwrap();
+
+        // First upsert: rows land with embedding populated (the column is
+        // nullable but we're filling it).
+        idx.upsert_chunks(vec![batch]).await.unwrap();
+        // Manually build the vector index since upsert path covers FTS only.
+        ensure_vector_index(&idx.table).await.unwrap();
+
+        // Query with a vector close to row "a" — expect "a" first.
+        let hits = idx.vector(&[0.9, 0.1, 0.0, 0.0], 2, None).await.unwrap();
+        assert!(!hits.is_empty(), "vector() returned no hits");
+        assert_eq!(hits[0].id, "a", "expected 'a' as nearest, got {hits:?}");
+        // Cosine similarity = 1 - cosine_distance; identical-direction
+        // vectors score ~1, orthogonal ~0. We're not quite identical so
+        // just demand the right ordering and a positive score.
+        assert!(hits[0].score > 0.0);
+    }
+
+    /// Build the non-embedding columns of a chunk batch. The caller supplies
+    /// the `embedding` column; this helper handles every other deterministic
+    /// field so the two batches (NULL-embedding seed vs populated update)
+    /// share construction logic.
+    fn chunk_cols_without_embedding(ids: &[&str]) -> Vec<ArrayRef> {
+        let n = ids.len();
+        let uris: Vec<String> = ids.iter().map(|i| format!("markq://default/{i}")).collect();
+        let paths: Vec<String> = ids.iter().map(|i| format!("{i}.md")).collect();
+        let hashes: Vec<String> = ids.iter().map(|i| format!("hash-{i}")).collect();
+        let texts: Vec<String> = ids.iter().map(|i| format!("text for {i}")).collect();
+        vec![
+            Arc::new(StringArray::from(ids.to_vec())),
+            Arc::new(StringArray::from(vec!["default"; n])),
+            Arc::new(StringArray::from(uris)),
+            Arc::new(StringArray::from(paths)),
+            Arc::new(StringArray::from(hashes)),
+            Arc::new(Int64Array::from(vec![0i64; n])),
+            Arc::new(Int32Array::from(vec![0i32; n])),
+            Arc::new(StringArray::from(texts)),
+            Arc::new(Int32Array::from(vec![Some(1i32); n])),
+            // embedding slot — caller fills index 9
+            Arc::new(StringArray::from(Vec::<&str>::new())), // placeholder, replaced below
+            Arc::new(StringArray::from(vec![None as Option<&str>; n])),
+            Arc::new(Int32Array::from(vec![SCHEMA_VERSION as i32; n])),
+        ]
+    }
+
+    fn batch_with_embedding(schema: &SchemaRef, ids: &[&str], embedding: ArrayRef) -> RecordBatch {
+        let mut cols = chunk_cols_without_embedding(ids);
+        cols[9] = embedding;
+        RecordBatch::try_new(schema.clone(), cols).unwrap()
+    }
+
+    #[tokio::test]
+    async fn scan_unembedded_and_apply_embeddings_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chunks.lance");
+        let idx = LanceIndex::open_or_create_with_dim(&path, 4).await.unwrap();
+        let schema = idx.arrow_schema();
+
+        // Seed 4 rows with NULL embeddings, mirroring how `markq index` lands
+        // chunks before `markq embed` runs.
+        let embedding_dtype = schema
+            .field_with_name(ChunkColumn::EMBEDDING)
+            .unwrap()
+            .data_type();
+        let null_embedding: ArrayRef = new_null_array(embedding_dtype, 4);
+        let seed = batch_with_embedding(&schema, &["a", "b", "c", "d"], null_embedding);
+        idx.upsert_chunks(vec![seed]).await.unwrap();
+        assert_eq!(idx.count_rows().await.unwrap(), 4);
+
+        // Initial scan returns all four unembedded rows.
+        let unembedded = idx.scan_unembedded(None).await.unwrap();
+        let total: usize = unembedded.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 4, "all rows should be unembedded initially");
+
+        // Populate embeddings on two rows ("a" and "c") via merge_insert.
+        // The merge is keyed on `id`, so the other columns must match
+        // existing rows exactly to avoid creating new ones.
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let values = Float32Array::from(vec![1.0_f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        let populated: ArrayRef =
+            Arc::new(FixedSizeListArray::try_new(item, 4, Arc::new(values), None).unwrap());
+        let updated = batch_with_embedding(&schema, &["a", "c"], populated);
+        let n_applied = idx.apply_embeddings(vec![updated]).await.unwrap();
+        assert_eq!(n_applied, 2);
+        assert_eq!(
+            idx.count_rows().await.unwrap(),
+            4,
+            "merge_insert must not create new rows when ids match"
+        );
+
+        // After the merge, only "b" and "d" should still come back as
+        // unembedded.
+        let remaining = idx.scan_unembedded(None).await.unwrap();
+        let mut remaining_ids: Vec<String> = remaining
+            .iter()
+            .flat_map(|batch| {
+                let ids = column_string(batch, ChunkColumn::ID).unwrap();
+                (0..batch.num_rows())
+                    .map(|i| ids.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        remaining_ids.sort();
+        assert_eq!(remaining_ids, vec!["b".to_string(), "d".to_string()]);
+    }
 
     #[tokio::test]
     async fn create_writes_metadata_and_round_trips() {

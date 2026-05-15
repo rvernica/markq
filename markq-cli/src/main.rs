@@ -10,7 +10,7 @@ use markq_core::{default_dataset_path, Index};
 use markq_index_lance::LanceIndex;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use markq_cli::{indexer, search};
+use markq_cli::{embedder_cmd, indexer, search, vsearch};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -185,14 +185,14 @@ async fn main() -> Result<()> {
         Command::Chunk(args) => cmd_chunk(&args),
         Command::Index(args) => cmd_index(&dataset_path, &args).await,
         Command::Search(args) => cmd_search(&dataset_path, &args).await,
+        Command::Embed(args) => cmd_embed(&dataset_path, &args).await,
+        Command::Vsearch(args) => cmd_vsearch(&dataset_path, &args).await,
 
         // Every other v1 subcommand has its name + arg shape registered now
         // so `markq --help` matches the final surface; bodies land in their
         // respective milestones.
-        Command::Embed(_)
-        | Command::Collection(_)
+        Command::Collection(_)
         | Command::Context(_)
-        | Command::Vsearch(_)
         | Command::Query(_)
         | Command::Rerank(_)
         | Command::Get(_)
@@ -224,6 +224,56 @@ async fn cmd_index(dataset_path: &std::path::Path, args: &IndexArgs) -> Result<(
         report.chunks,
         idx.path().display()
     );
+    Ok(())
+}
+
+async fn cmd_embed(dataset_path: &std::path::Path, args: &EmbedArgs) -> Result<()> {
+    if args.collection.is_some() {
+        anyhow::bail!("multi-collection embed is not implemented yet; omit -c for now");
+    }
+    let idx = LanceIndex::open_or_create(dataset_path)
+        .await
+        .context("open or create dataset")?;
+    let report = embedder_cmd::run_embed(&idx).await?;
+    println!(
+        "embedded {} row(s) over {} batch(es) (model={}, dim={})",
+        report.rows, report.batches, report.model_id, report.dim,
+    );
+    Ok(())
+}
+
+async fn cmd_vsearch(dataset_path: &std::path::Path, args: &QueryArgs) -> Result<()> {
+    if args.collection.is_some() {
+        anyhow::bail!("collection filtering is not implemented yet; omit -c for now");
+    }
+    if args.explain {
+        anyhow::bail!("--explain is not implemented yet");
+    }
+    let format = match (args.json, args.files) {
+        (true, true) => anyhow::bail!("--json and --files are mutually exclusive"),
+        (true, false) => search::Format::Json,
+        (false, true) => search::Format::Files,
+        (false, false) => search::Format::Table,
+    };
+    let opts = search::SearchOptions {
+        top_k: if args.all { None } else { Some(args.top_k) },
+        min_score: args.min_score,
+    };
+    let idx = LanceIndex::open_or_create(dataset_path)
+        .await
+        .context("open or create dataset")?;
+    let k = match opts.top_k {
+        Some(k) => k,
+        None => idx
+            .count_rows()
+            .await
+            .context("count rows for --all")?
+            .max(1),
+    };
+    let hits = vsearch::run_vsearch(&idx, &args.query, k, &opts).await?;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    search::write_results(&mut out, &hits, format)?;
     Ok(())
 }
 

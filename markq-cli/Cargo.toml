@@ -16,6 +16,7 @@ path = "src/main.rs"
 markq-core.workspace = true
 markq-chunker.workspace = true
 markq-index-lance.workspace = true
+markq-inference.workspace = true
 
 anyhow.workspace = true
 arrow-array.workspace = true
@@ -27,6 +28,13 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 walkdir.workspace = true
+
+[features]
+# Forward GPU-offload features down to markq-inference so a user can opt in
+# with `cargo build --features vulkan` (or `cuda`) from the workspace root.
+default = []
+vulkan = ["markq-inference/vulkan"]
+cuda = ["markq-inference/cuda"]
 
 [dev-dependencies]
 tempfile.workspace = true
