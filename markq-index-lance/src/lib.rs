@@ -636,12 +636,12 @@ impl Index for LanceIndex {
         k: usize,
         _collection: Option<&str>,
     ) -> Result<Vec<ChunkHit>> {
-        // PHASE1_FOLLOWUPS #2 (hyphen-aware FTS5 sanitizer) lands with the
-        // hybrid path in ; for we pass the raw query through
-        // and let LanceDB's tokenizer match document-side terms. The 0c
-        // spike showed this recalls hyphenated identifiers correctly on the
-        // lance side — the regression was specifically on the qmd / SQLite
-        // FTS5 side, which we don't ship.
+        // Pass the raw query through and let LanceDB's tokenizer match
+        // document-side terms. Tantivy splits on non-alphanumerics
+        // symmetrically on both sides, so hyphenated identifiers like
+        // `tree-sitter` match without any query rewriting. The
+        // implicit-AND vs implicit-OR decision is open (see
+        // PHASE1_FOLLOWUPS #2) and lands with the hybrid path.
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
