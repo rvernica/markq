@@ -165,4 +165,29 @@ mod tests {
         assert_eq!(a.contributions[1].source, "vec");
         assert_eq!(a.contributions[1].rank, 2);
     }
+
+    #[test]
+    fn bonus_applies_to_top_three_only() {
+        let lex: Vec<ChunkHit> = (0..5).map(|i| hit(&format!("d{i}"))).collect();
+        let cfg = FusionConfig::default();
+        let fused = fuse(&[("lex", &lex)], &cfg);
+
+        // d0..d2 (ranks 1..3) get a bonus; d3, d4 do not.
+        assert!(fused[0].contributions[0].bonus > 0.0);
+        assert!(fused[1].contributions[0].bonus > 0.0);
+        assert!(fused[2].contributions[0].bonus > 0.0);
+        assert_eq!(fused[3].contributions[0].bonus, 0.0);
+        assert_eq!(fused[4].contributions[0].bonus, 0.0);
+    }
+
+    #[test]
+    fn doc_in_only_one_list_gets_one_contribution() {
+        let lex = vec![hit("solo")];
+        let vec_list: Vec<ChunkHit> = Vec::new();
+        let cfg = FusionConfig::default();
+        let fused = fuse(&[("lex", &lex), ("vec", &vec_list)], &cfg);
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].contributions.len(), 1);
+        assert_eq!(fused[0].contributions[0].source, "lex");
+    }
 }
