@@ -10,7 +10,7 @@ use markq_core::{default_dataset_path, Index};
 use markq_index_lance::LanceIndex;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use markq_cli::{embedder_cmd, indexer, search, vsearch};
+use markq_cli::{embedder_cmd, indexer, query, search, vsearch};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -187,13 +187,13 @@ async fn main() -> Result<()> {
         Command::Search(args) => cmd_search(&dataset_path, &args).await,
         Command::Embed(args) => cmd_embed(&dataset_path, &args).await,
         Command::Vsearch(args) => cmd_vsearch(&dataset_path, &args).await,
+        Command::Query(args) => cmd_query(&dataset_path, &args).await,
 
         // Every other v1 subcommand has its name + arg shape registered now
         // so `markq --help` matches the final surface; bodies land in their
         // respective milestones.
         Command::Collection(_)
         | Command::Context(_)
-        | Command::Query(_)
         | Command::Rerank(_)
         | Command::Get(_)
         | Command::MultiGet(_)
@@ -274,6 +274,47 @@ async fn cmd_vsearch(dataset_path: &std::path::Path, args: &QueryArgs) -> Result
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     search::write_results(&mut out, &hits, format)?;
+    Ok(())
+}
+
+async fn cmd_query(dataset_path: &std::path::Path, args: &QueryArgs) -> Result<()> {
+    if args.collection.is_some() {
+        anyhow::bail!("collection filtering is not implemented yet; omit -c for now");
+    }
+    let format = match (args.json, args.files) {
+        (true, true) => anyhow::bail!("--json and --files are mutually exclusive"),
+        (true, false) => search::Format::Json,
+        (false, true) => search::Format::Files,
+        (false, false) => search::Format::Table,
+    };
+    let opts = search::SearchOptions {
+        top_k: if args.all { None } else { Some(args.top_k) },
+        min_score: args.min_score,
+    };
+
+    let idx = LanceIndex::open(dataset_path)
+        .await
+        .context("open dataset")?;
+    let k = match opts.top_k {
+        Some(k) => k,
+        None => idx
+            .count_rows()
+            .await
+            .context("count rows for --all")?
+            .max(1),
+    };
+
+    let outcome = query::run_query(&idx, &args.query, k, &opts, args.explain).await?;
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    search::write_results(&mut out, &outcome.hits, format)?;
+
+    if let Some(trace) = &outcome.explain {
+        let stderr = std::io::stderr();
+        let mut err = stderr.lock();
+        query::write_explain(&mut err, trace, &outcome.hits)?;
+    }
     Ok(())
 }
 
