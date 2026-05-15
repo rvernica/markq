@@ -28,11 +28,20 @@ pub async fn run_embed_query<W: Write>(
             .await
             .context("open dataset")?;
         let md = idx.metadata().await.context("read dataset metadata")?;
-        if let Some(existing) = md.embedder_model.as_deref() {
-            if existing != model.id() {
+        match md.embedder_model.as_deref() {
+            Some(existing) if existing != model.id() => {
                 anyhow::bail!(
                     "dataset was built with embedder {existing}, but this build only knows {}",
                     model.id()
+                );
+            }
+            Some(_) => {}
+            None => {
+                // A printed vector would not be useful against a dataset
+                // with no stored vectors; match `markq vsearch`'s guard so
+                // the failure mode is the same across read paths.
+                anyhow::bail!(
+                    "no embeddings in this dataset; run `markq embed` first to populate them"
                 );
             }
         }
@@ -49,13 +58,14 @@ pub async fn run_embed_query<W: Write>(
         .await
         .context("embed query")?;
 
-    write!(out, "[")?;
-    for (i, v) in vec.iter().enumerate() {
-        if i > 0 {
-            write!(out, ",")?;
-        }
-        write!(out, "{v}")?;
-    }
-    writeln!(out, "]")?;
+    write_json_array(out, &vec)
+}
+
+/// Write `v` as a single-line JSON array on `out` (newline-terminated).
+/// Uses `serde_json` so a non-finite component (NaN, ±inf) becomes a hard
+/// error rather than a string that downstream JSON parsers silently reject.
+pub fn write_json_array<W: Write>(out: &mut W, v: &[f32]) -> Result<()> {
+    serde_json::to_writer(&mut *out, v).context("serialize embedding as JSON")?;
+    writeln!(out)?;
     Ok(())
 }
