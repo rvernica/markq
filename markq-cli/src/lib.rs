@@ -4,5 +4,6 @@
 
 pub mod embedder_cmd;
 pub mod indexer;
+pub mod query;
 pub mod search;
 pub mod vsearch;
