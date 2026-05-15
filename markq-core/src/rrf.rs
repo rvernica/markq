@@ -53,13 +53,16 @@ pub fn fuse(lists: &[(&'static str, &[ChunkHit])], cfg: &FusionConfig) -> Vec<Fu
     use std::collections::HashMap;
 
     let mut by_id: HashMap<String, FusedHit> = HashMap::new();
-    let mut order: Vec<String> = Vec::new();
 
     for (source, list) in lists {
         let weight = cfg.weights.get(source).copied().unwrap_or(0.0);
         for (idx, h) in list.iter().enumerate() {
             let rank = idx + 1;
             let rrf_value = weight / (cfg.k as f32 + rank as f32);
+            // Bonus is applied per source contribution, so a hit ranked
+            // within `top_rank_bonus.len()` in multiple lists accumulates
+            // the bonus once per list (e.g. rank 1 in both lex and vec
+            // earns the rank-1 bonus twice).
             let bonus = if rank <= cfg.top_rank_bonus.len() {
                 cfg.top_rank_bonus[rank - 1]
             } else {
@@ -78,7 +81,6 @@ pub fn fuse(lists: &[(&'static str, &[ChunkHit])], cfg: &FusionConfig) -> Vec<Fu
                     existing.contributions.push(contribution);
                 }
                 None => {
-                    order.push(h.id.clone());
                     by_id.insert(
                         h.id.clone(),
                         FusedHit {
@@ -92,11 +94,7 @@ pub fn fuse(lists: &[(&'static str, &[ChunkHit])], cfg: &FusionConfig) -> Vec<Fu
         }
     }
 
-    let mut out: Vec<FusedHit> = order
-        .into_iter()
-        .map(|id| by_id.remove(&id).expect("seeded above"))
-        .collect();
-
+    let mut out: Vec<FusedHit> = by_id.into_values().collect();
     out.sort_by(|a, b| {
         b.final_score
             .partial_cmp(&a.final_score)
