@@ -2,10 +2,12 @@
 
 This file covers what the binary actually does today. The current build
 ships the workspace skeleton, `markq inspect`, `markq index` (markdown
-walk + chunk + FTS index build), and `markq search` (BM25 over the FTS
-index). Every other v1 subcommand is registered (so `markq --help` shows
-the final surface) but stubs out at runtime. Each will be lit up as the
-corresponding feature work lands.
+walk + chunk + FTS index build), `markq search` (BM25 over the FTS
+index), `markq embed` (fills the embedding column via Qwen3-Embedding-
+0.6B Q8_0 over llama.cpp), and `markq vsearch` (cosine KNN over the
+HNSW vector index). Every other v1 subcommand is registered (so
+`markq --help` shows the final surface) but stubs out at runtime. Each
+will be lit up as the corresponding feature work lands.
 
 All output below was captured against the default dataset at
 `~/.markq/chunks.lance` after indexing this repo's `README.md`. Paths in
@@ -111,7 +113,7 @@ Options:
 Calling a stub fails fast with exit 1:
 
 ```sh
-markq vsearch "anything"
+markq query "anything"
 ```
 
 ```
@@ -123,15 +125,18 @@ Error: not implemented yet
 | Command | Status |
 |---------|--------|
 | `inspect` | ✅ Implemented |
-| `index <path>` | ✅ Implemented (walk, chunk, FTS build; no embeddings yet) |
+| `index <path>` | ✅ Implemented (walk, chunk, FTS build) |
 | `search <query>` | ✅ Implemented (BM25 via Lance inverted index) |
-| `embed`, `vsearch`, `query`, `rerank` | Stub (`not implemented yet`) |
+| `embed` | ✅ Implemented (Qwen3-Embedding-0.6B Q8_0, HNSW index build) |
+| `vsearch <query>` | ✅ Implemented (cosine KNN over the HNSW vector index) |
+| `query`, `rerank` | Stub (`not implemented yet`) |
 | `get`, `multi-get`, `compact`, `doctor` | Stub |
 | `status`, `config` | Stub |
 | `collection {add,list,remove}` | Stub |
 | `context add`, `models {pull,ls}` | Stub |
 | `watch`, `serve` | Stub |
 | `search --explain`, `search --collection <name>` | Returns a structured "not implemented" error |
+| `vsearch --explain`, `vsearch --collection <name>` | Same — recognized but gated |
 
 ## `markq inspect`
 
@@ -163,6 +168,14 @@ schema_version:            1
 lance_manifest_version:    1
 lance_file_format_version: 2.0
 lancedb_crate_version:     0.27.2
+```
+
+After `markq embed` has run on the dataset, two more lines appear at
+the bottom:
+
+```
+embedder_model:            Qwen/Qwen3-Embedding-0.6B-GGUF/Q8_0
+embedder_dim:              1024
 ```
 
 The default dataset path is `~/.markq/chunks.lance`. First run creates
@@ -270,6 +283,118 @@ markq search "lance" --json -n 1
     "uri": "markq://default/"
   }
 ]
+```
+
+## `markq embed`
+
+`embed` fills the `embedding` column for every row where it's currently
+NULL. The first run downloads the embedder GGUF from Hugging Face
+(`Qwen/Qwen3-Embedding-0.6B-GGUF`, ~640 MB, Q8_0 quantization) into
+`~/.cache/markq/models/`; subsequent runs reuse the cached file.
+
+```sh
+markq embed
+```
+
+```
+embedded 13 row(s) over 1 batch(es) (model=Qwen/Qwen3-Embedding-0.6B-GGUF/Q8_0, dim=1024)
+```
+
+What runs under the hood:
+
+1. `model_cache::ensure_model` — checks `~/.cache/markq/models/` for the
+   GGUF, downloads via `hf-hub` if absent. Override the cache root with
+   `MARKQ_MODELS_DIR=/some/path`.
+2. `Embedder::load` — spawns one owner thread that holds the
+   `LlamaModel` + `LlamaContext` (the context is `!Send`, so a single
+   thread is the only correct shape). Requests flow in over a bounded
+   `crossbeam-channel`.
+3. `validate_or_record_embedder` — on first embed, writes
+   `markq.embedder_model` and `markq.embedder_dim` to the dataset
+   metadata. On later runs, mismatches raise a typed
+   `EmbedderDimMismatch` error rather than silently corrupting
+   recall.
+4. Each unembedded row is tokenized, decoded with pooling=`Last` (the
+   model's documented default), and merge-inserted back keyed on `id`.
+5. After each batch, an `IvfHnswSq` Cosine vector index is
+   (re)built on the `embedding` column.
+
+`embed` is idempotent — running it on a fully-embedded dataset is a
+no-op:
+
+```sh
+markq embed
+```
+
+```
+embedded 0 row(s) over 0 batch(es) (model=Qwen/Qwen3-Embedding-0.6B-GGUF/Q8_0, dim=1024)
+```
+
+Ctrl-C drains cleanly: the in-flight batch finishes (decoding is never
+aborted mid-batch), the result is flushed, and the process exits. No
+partial-batch corruption.
+
+The embedder thread holds the model in RAM only for the lifetime of the
+`markq embed` invocation. Re-runs reload the weights, but llama.cpp
+memory-maps the GGUF and the file's pages stay in the OS page cache,
+so the second cold-start is sub-second. A long-running daemon mode
+(weights stay warm across queries) lands with `markq serve` in
+Phase 12.
+
+GPU offload is opt-in via Cargo features:
+
+```sh
+cargo build --release --features vulkan   # or cuda
+```
+
+Without those features the binary stays CPU-only and ignores GPU
+detection. The Phase 4 build supports the inference-thread + bounded-
+channel pattern that Phase 6 (reranker) and Phase 13 (HyDE generator)
+will copy verbatim.
+
+## `markq vsearch`
+
+Cosine vector retrieval. Embeds the query with the same model recorded
+in the dataset's `markq.embedder_model` key, then runs HNSW KNN against
+the `embedding` column.
+
+```sh
+markq vsearch "how does reranking work" -n 3
+```
+
+```
+  1.   0.094  markq://default/SYNTAX.md#6
+     Vec queries are natural language questions. No special syntax — just write what you're looking for. …
+  2.  -0.014  markq://default/SYNTAX.md#7
+     Hyde queries are hypothetical answer passages (50-100 words). Write what you expect the answer to lo…
+  3.  -0.103  markq://default/SYNTAX.md#9
+     An expand query stands alone; it's not mixed with typed lines. You can either rely on the default un…
+```
+
+The score column is the **cosine similarity** (`1 - distance`); higher
+is better, matching the BM25 convention. Values sit in `[-1, 1]` —
+unlike BM25 scores which are unbounded log-domain numbers.
+
+`--json`, `--files`, `-n`, `--min-score`, and `--all` all work the
+same as `markq search` (the formatters are shared). `--explain` and
+`-c/--collection` are recognized but gated (Phase 5 / Phase 10).
+
+Running `vsearch` against a dataset without embeddings produces a clean
+error and does **not** load the model:
+
+```sh
+markq --dataset /tmp/empty.lance vsearch "anything"
+```
+
+```
+Error: no embeddings in this dataset; run `markq embed` first to populate them
+```
+
+Same shape if the dataset was embedded with a model this binary doesn't
+know about:
+
+```
+Error: dataset was built with embedder Some("some-other-model/Q4_K_M"), but this build only knows Qwen/Qwen3-Embedding-0.6B-GGUF/Q8_0
 ```
 
 ## Use a throwaway dataset

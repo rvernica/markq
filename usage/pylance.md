@@ -17,10 +17,12 @@ this repo's `README.md`. Reproduce it with:
 
 ```sh
 markq index README.md
+markq embed   # optional; some examples below assume the embedding column is populated
 ```
 
-That populates 8 chunks with NULL embeddings (vector embeddings land once
-`markq embed` is functional) and builds the FTS inverted index on `text`.
+`index` populates 8 chunks and builds the FTS inverted index on `text`.
+`embed` fills the `embedding` column (1024-float vectors from
+Qwen3-Embedding-0.6B Q8_0) and adds an HNSW vector index alongside.
 
 ## Prerequisites
 
@@ -70,14 +72,18 @@ print(json.dumps(ds.config(), indent=2))
 ```json
 {
   "lance.auto_cleanup.older_than": "14days",
-  "markq.lance_manifest_version": "1",
-  "markq.schema_version": "1",
-  "markq.lancedb_crate_version": "0.27.2",
   "lance.auto_cleanup.interval": "20",
-  "markq.lance_file_format_version": "2.0"
+  "markq.lance_manifest_version": "1",
+  "markq.embedder_dim": "1024",
+  "markq.lancedb_crate_version": "0.27.2",
+  "markq.schema_version": "1",
+  "markq.lance_file_format_version": "2.0",
+  "markq.embedder_model": "Qwen/Qwen3-Embedding-0.6B-GGUF/Q8_0"
 }
 ```
 
+`markq.embedder_model` and `markq.embedder_dim` appear only after
+`markq embed` has run; before that the dict has the other six entries.
 This is what `markq doctor` will read via the Rust API and turn into
 structured errors on mismatch. From Python you can sanity-check it without
 going through the binary.
@@ -172,8 +178,19 @@ schema_version     int32
 ```
 
 The `embedding` column round-trips as Python objects (NumPy `float32` arrays
-of length 1024); use `np.stack(df["embedding"])` for a 2D matrix once
-embeddings are populated.
+of length 1024); use `np.stack(df["embedding"])` for a 2D matrix:
+
+```python
+import numpy as np
+mat = np.stack(df["embedding"])
+print(mat.shape, mat.dtype)
+# (8, 1024) float32
+```
+
+Each row is a raw model output, not unit-normalized. Cosine-similarity
+search inside Lance handles the normalization on its end; if you want
+to do offline math, normalize first (`mat / np.linalg.norm(mat, axis=1,
+keepdims=True)`).
 
 ### Projection and filter (push-down to Lance)
 
@@ -298,33 +315,47 @@ print("tags:    ", ds.tags.list())
 
 ```
 fragments: 1
-indices:  [{'name': 'text_idx', 'type': 'Inverted', 'uuid': '…', 'fields': ['text'], 'version': 3, 'fragment_ids': {0}, 'base_id': None}]
+indices:  [
+  {'name': 'text_idx',      'type': 'Inverted',    'fields': ['text'],      'version': 3, ...},
+  {'name': 'embedding_idx', 'type': 'IVF_HNSW_SQ', 'fields': ['embedding'], 'version': 6, ...},
+]
 tags:     {}
 ```
 
-The `text_idx` Inverted index is what `markq search` (BM25) hits. An HNSW
-index over `embedding` will appear here once `markq embed` is wired up.
+`text_idx` is the BM25 inverted index built by `markq index`.
+`embedding_idx` is the `IvfHnswSq` vector index built by `markq embed`
+(distance metric: Cosine).
 
 ## Vector search
 
-The API shape, for reference — none of these run yet because the
-`embedding` column is all NULL:
+After `markq embed` has run, `ds.scanner(nearest={...})` performs HNSW
+KNN against the `embedding` column:
 
 ```python
-# Once `markq embed` has populated the embedding column and built the index:
+import numpy as np, os, lance
+ds = lance.dataset(os.path.expanduser("~/.markq/chunks.lance"))
+# In practice you'd produce `query_vector` with the same embedder markq
+# uses (Qwen3-Embedding-0.6B Q8_0); here we just use the first row's
+# vector as a stand-in to demonstrate the API.
+query_vector = ds.to_table(columns=["embedding"]).column("embedding")[0].as_py()
+query_vector = np.asarray(query_vector, dtype=np.float32)
+
 results = ds.scanner(
     nearest={
         "column": "embedding",
         "q": query_vector,        # numpy.ndarray, shape (1024,), dtype float32
-        "k": 10,
+        "k": 3,
         "metric": "cosine",
     },
-    columns=["path", "chunk_index", "text"],
+    columns=["path", "chunk_index", "_distance"],
 ).to_table()
+print(results)
 ```
 
-The Rust code path in `markq-index-lance` will be the source of truth; the
-Python API mirrors it for ad-hoc analytics.
+Lance returns the `_distance` column alongside the requested ones;
+cosine similarity is `1 - _distance`, which is what `markq vsearch`
+prints. The Rust code path in `markq-index-lance` is the source of
+truth; the Python API mirrors it for ad-hoc analytics.
 
 ## Downstream libraries that build on `lance.dataset(...)`
 

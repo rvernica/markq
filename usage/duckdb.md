@@ -6,11 +6,13 @@ This is the composable-stack payoff that comes from storing chunks as a bare
 Lance dataset rather than an opaque internal index.
 
 All output below is from real runs against the default dataset after
-indexing this repo's `README.md` (8 chunks, no embeddings yet — those
-populate once `markq embed` is functional). Reproduce it with:
+indexing this repo's `README.md` (8 chunks). Some examples additionally
+require `markq embed` to have run on the dataset (Phase 4 onward —
+`embedding` column populated, HNSW index built). Reproduce with:
 
 ```sh
 markq index README.md
+markq embed   # ~640 MB GGUF downloaded on first run
 ```
 
 ## Prerequisites
@@ -81,7 +83,30 @@ DESCRIBE mq.chunks;
 ```
 
 The `embedding` column is a fixed-size 1024-float vector — DuckDB can read it
-natively, no UDF needed. It stays NULL until `markq embed` is functional.
+natively, no UDF needed. Before `markq embed` runs the column is all
+NULL; after `embed`, each row holds a Qwen3-Embedding-0.6B Q8_0 vector.
+
+```sql
+SELECT chunk_index, length(embedding) AS dim, embedding[1:3] AS first3
+FROM mq.chunks
+ORDER BY chunk_index
+LIMIT 3;
+```
+
+```
+┌─────────────┬───────┬──────────────────────────────────────┐
+│ chunk_index │  dim  │                first3                │
+│    int32    │ int64 │               float[]                │
+├─────────────┼───────┼──────────────────────────────────────┤
+│           0 │  1024 │ [0.9659123, 0.7466198, -0.41592225]  │
+│           1 │  1024 │ [1.649999, -0.61234635, -0.23107512] │
+│           2 │  1024 │ [-2.1656308, -4.877181, -0.7711788]  │
+└─────────────┴───────┴──────────────────────────────────────┘
+```
+
+DuckDB array slicing is 1-indexed (`[1:3]` returns elements 1, 2, 3 —
+not 1, 2). The values are raw model output, not unit-normalized;
+markq's `vsearch` path computes cosine distance under the hood.
 
 ### Count and select
 
@@ -223,9 +248,15 @@ FROM lance_fts('/home/user/.markq/chunks.lance', 'text', 'lance',
 
 Scores match `markq search "lance"` exactly — same underlying index.
 
-**Vector** (`lance_vector_search`) and **Hybrid** (`lance_hybrid_search`,
-`alpha` weighting BM25 vs vector) need populated embeddings and an HNSW
-index first; they'll light up once `markq embed` is functional.
+**Vector** (`lance_vector_search`) works after `markq embed` has run —
+the dataset then carries both populated vectors and an `IvfHnswSq`
+index on the `embedding` column. You'd supply the query vector
+externally (DuckDB doesn't run the embedder); the markq Rust CLI takes
+care of that for you via `markq vsearch`.
+
+**Hybrid** (`lance_hybrid_search`, `alpha` weighting BM25 vs vector)
+will see real signal once both indexes are populated together. The
+markq-side hybrid `markq query` ships in Phase 5 with RRF fusion.
 
 ## Lance auto-cleanup config
 
@@ -254,9 +285,10 @@ compact` will tune these on demand once it's wired up.
 
 The markq metadata keys we wrote at create time (`markq.schema_version`,
 `markq.lance_manifest_version`, `markq.lance_file_format_version`,
-`markq.lancedb_crate_version`) live in Lance's user `config` map. The DuckDB
-extension does not surface this map through SQL — only its own
-`auto_cleanup.*` keys are exposed.
+`markq.lancedb_crate_version`) live in Lance's user `config` map.
+`markq embed` adds two more (`markq.embedder_model`,
+`markq.embedder_dim`). The DuckDB extension does not surface this map
+through SQL — only its own `auto_cleanup.*` keys are exposed.
 
 To read the markq metadata, use pylance instead:
 
@@ -270,11 +302,13 @@ print(json.dumps(lance.dataset('$HOME/.markq/chunks.lance').config(), indent=2))
 ```json
 {
   "lance.auto_cleanup.older_than": "14days",
-  "markq.lance_manifest_version": "1",
-  "markq.schema_version": "1",
-  "markq.lancedb_crate_version": "0.27.2",
   "lance.auto_cleanup.interval": "20",
-  "markq.lance_file_format_version": "2.0"
+  "markq.lance_manifest_version": "1",
+  "markq.embedder_dim": "1024",
+  "markq.lancedb_crate_version": "0.27.2",
+  "markq.schema_version": "1",
+  "markq.lance_file_format_version": "2.0",
+  "markq.embedder_model": "Qwen/Qwen3-Embedding-0.6B-GGUF/Q8_0"
 }
 ```
 

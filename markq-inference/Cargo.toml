@@ -5,7 +5,30 @@ edition.workspace = true
 publish.workspace = true
 license.workspace = true
 
-# Phase 4 (embedder) and Phase 6 (reranker) wire `llama-cpp-2` here. Phase 1
-# stub keeps llama.cpp's vendored CMake build off the critical path.
+# `llama-cpp-2` builds llama.cpp via CMake on first compile (~5 min on a
+# workstation). `.cargo/config.toml` feeds the Fedora clang resource directory
+# through bindgen so `llama-cpp-sys-2` can locate `stdbool.h` et al.
+#
+# `vulkan` / `cuda` features below forward to the underlying crate; CPU-only
+# is the default and the documented support matrix.
 [dependencies]
 markq-core.workspace = true
+llama-cpp-2.workspace = true
+hf-hub.workspace = true
+crossbeam-channel.workspace = true
+sha2.workspace = true
+hex.workspace = true
+once_cell.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+dirs.workspace = true
+
+[features]
+default = []
+vulkan = ["llama-cpp-2/vulkan"]
+cuda = ["llama-cpp-2/cuda"]
+
+[dev-dependencies]
+tempfile.workspace = true
