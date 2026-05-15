@@ -62,12 +62,13 @@ impl KnownModel {
 
 /// The directory markq caches model files in. Honors `$MARKQ_MODELS_DIR`,
 /// then falls back to `$XDG_CACHE_HOME/markq/models`, then `~/.cache/markq/
-/// models`, then `./.markq/models` if `$HOME` is unset.
+/// models`, then `./markq/models` if no cache dir can be resolved (containers,
+/// CI without `$HOME`).
 pub fn models_dir() -> PathBuf {
     if let Ok(p) = std::env::var("MARKQ_MODELS_DIR") {
         return PathBuf::from(p);
     }
-    let mut p = dirs::cache_dir().unwrap_or_else(|| PathBuf::from("./.markq"));
+    let mut p = dirs::cache_dir().unwrap_or_else(|| PathBuf::from("."));
     p.push("markq");
     p.push("models");
     p

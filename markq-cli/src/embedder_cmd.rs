@@ -2,8 +2,9 @@
 //!
 //! Loops over batches of `embedding IS NULL` rows, embeds each text via the
 //! markq-inference `Embedder` (one owner thread + bounded crossbeam channel),
-//! and merge-inserts the embedded batch back keyed on `id`. After each
-//! merge the LanceDB vector index is rebuilt; the BM25 path is untouched.
+//! and merge-inserts the embedded batch back keyed on `id`. The LanceDB
+//! vector index is rebuilt once after the loop drains, not per batch; the
+//! BM25 path is untouched.
 //!
 //! Ctrl-C drains cleanly: a signal flips a flag that's checked between
 //! batches. An in-flight batch always finishes — never abort mid-decode.
@@ -96,6 +97,14 @@ pub async fn run_embed(idx: &LanceIndex) -> Result<EmbedReport> {
     // Don't leave the signal task hanging — abort after the loop exits
     // normally so re-running embed in the same process gets a fresh handler.
     signal_task.abort();
+
+    // Build the HNSW vector index once, after every merge has landed. Doing
+    // it per batch would trigger a full rebuild on every 256-row chunk.
+    if total_rows > 0 {
+        idx.rebuild_vector_index()
+            .await
+            .context("rebuild vector index")?;
+    }
 
     Ok(EmbedReport {
         rows: total_rows,

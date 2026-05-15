@@ -259,9 +259,9 @@ async fn cmd_vsearch(dataset_path: &std::path::Path, args: &QueryArgs) -> Result
         top_k: if args.all { None } else { Some(args.top_k) },
         min_score: args.min_score,
     };
-    let idx = LanceIndex::open_or_create(dataset_path)
+    let idx = LanceIndex::open(dataset_path)
         .await
-        .context("open or create dataset")?;
+        .context("open dataset")?;
     let k = match opts.top_k {
         Some(k) => k,
         None => idx
@@ -296,9 +296,9 @@ async fn cmd_search(dataset_path: &std::path::Path, args: &QueryArgs) -> Result<
         min_score: args.min_score,
     };
 
-    let idx = LanceIndex::open_or_create(dataset_path)
+    let idx = LanceIndex::open(dataset_path)
         .await
-        .context("open or create dataset")?;
+        .context("open dataset")?;
     // For `--all`, size `k` from the row count so the BM25 query is not
     // silently truncated by a hardcoded budget. A query can't match more
     // chunks than exist.
