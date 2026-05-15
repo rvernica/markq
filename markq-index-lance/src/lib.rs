@@ -10,7 +10,7 @@ use arrow_array::{
     Array, Float32Array, Int32Array, RecordBatch, RecordBatchIterator, RecordBatchReader,
     StringArray,
 };
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use lance_index::scalar::FullTextSearchQuery;
@@ -43,6 +43,20 @@ impl LanceIndex {
     /// Open an existing dataset or create one with markq's chunk schema and
     /// metadata baked in.
     pub async fn open_or_create(dataset_path: &Path) -> Result<Self> {
+        Self::open_or_create_with_dim(dataset_path, EMBEDDING_DIM_DEFAULT).await
+    }
+
+    /// Open an existing dataset. Errors with a clean "dataset not found"
+    /// message if the path doesn't already point at a markq dataset, so
+    /// read-only commands like `markq search` / `markq vsearch` don't
+    /// silently materialize empty datasets on typos.
+    pub async fn open(dataset_path: &Path) -> Result<Self> {
+        if !dataset_path.exists() {
+            return Err(Error::Backend(anyhow::anyhow!(
+                "dataset not found at {} (run `markq index <path>` first)",
+                dataset_path.display()
+            )));
+        }
         Self::open_or_create_with_dim(dataset_path, EMBEDDING_DIM_DEFAULT).await
     }
 
@@ -171,6 +185,18 @@ impl LanceIndex {
                 Ok(false)
             }
             (None, None) => {
+                // Cross-check the caller's dim against the dataset's own
+                // FixedSizeList width before persisting. Otherwise a future
+                // KnownModel with a different dim would happily record a
+                // mismatched value here and only fail later as an opaque
+                // Arrow length error inside `apply_embeddings`.
+                let schema_dim = embedding_dim_from_schema(&self.schema)?;
+                if schema_dim != dim {
+                    return Err(Error::EmbedderDimMismatch {
+                        dataset: schema_dim,
+                        embedder: dim,
+                    });
+                }
                 native
                     .update_config(vec![
                         (KEY_EMBEDDER_MODEL.to_string(), model_id.to_string()),
@@ -220,8 +246,11 @@ impl LanceIndex {
     }
 
     /// Merge updated rows (same `id`, now with `embedding` populated) back
-    /// into the table. After a successful merge we (re)build the vector
-    /// index so the next `vector()` call has fresh state.
+    /// into the table.
+    ///
+    /// Note: this does **not** rebuild the vector index — callers running a
+    /// multi-batch loop should call [`LanceIndex::rebuild_vector_index`] once
+    /// after the loop instead of paying for a full index rebuild per batch.
     pub async fn apply_embeddings(&self, updated: Vec<RecordBatch>) -> Result<u64> {
         if updated.is_empty() {
             return Ok(0);
@@ -239,9 +268,29 @@ impl LanceIndex {
             .await
             .context("merge_insert embeddings")
             .map_err(Error::Backend)?;
-
-        ensure_vector_index(&self.table).await?;
         Ok(row_count)
+    }
+
+    /// (Re)build the HNSW Cosine vector index on the `embedding` column.
+    /// Idempotent: Lance treats `create_index` as create-or-replace.
+    pub async fn rebuild_vector_index(&self) -> Result<()> {
+        ensure_vector_index(&self.table).await
+    }
+}
+
+/// Read the `embedding` column's `FixedSizeList` element count from the
+/// dataset's Arrow schema. The column is locked in at create time, so this
+/// is the dim a freshly recorded `markq.embedder_dim` must match.
+fn embedding_dim_from_schema(schema: &SchemaRef) -> Result<u32> {
+    let field = schema
+        .field_with_name(ChunkColumn::EMBEDDING)
+        .context("schema missing embedding column")
+        .map_err(Error::Backend)?;
+    match field.data_type() {
+        DataType::FixedSizeList(_, n) => Ok(*n as u32),
+        other => Err(Error::Backend(anyhow::anyhow!(
+            "embedding column has unexpected data type {other:?}; expected FixedSizeList"
+        ))),
     }
 }
 
@@ -705,6 +754,34 @@ mod tests {
             }
             other => panic!("expected Error::Backend for model-id mismatch, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn validate_or_record_embedder_rejects_schema_dim_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chunks.lance");
+        // Dataset's FixedSizeList width is 4; recording with embedder dim=8
+        // must surface a clean EmbedderDimMismatch rather than write the
+        // wrong dim and fail later inside merge_insert.
+        let idx = LanceIndex::open_or_create_with_dim(&path, 4).await.unwrap();
+        let err = idx
+            .validate_or_record_embedder("test/embedder-x", 8)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::EmbedderDimMismatch {
+                    dataset: 4,
+                    embedder: 8
+                }
+            ),
+            "expected EmbedderDimMismatch{{dataset:4, embedder:8}}, got: {err:?}"
+        );
+        // And no metadata leaked into the dataset on the failed call.
+        let md = idx.metadata().await.unwrap();
+        assert!(md.embedder_model.is_none());
+        assert!(md.embedder_dim.is_none());
     }
 
     /// Build a single-row batch with explicit f32 embedding, merge it into a

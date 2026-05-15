@@ -383,6 +383,7 @@ Running `vsearch` against a dataset without embeddings produces a clean
 error and does **not** load the model:
 
 ```sh
+markq --dataset /tmp/empty.lance index README.md
 markq --dataset /tmp/empty.lance vsearch "anything"
 ```
 
@@ -390,11 +391,15 @@ markq --dataset /tmp/empty.lance vsearch "anything"
 Error: no embeddings in this dataset; run `markq embed` first to populate them
 ```
 
+(Running `vsearch` against a path that doesn't exist at all is a separate
+error — `markq` no longer materializes a fresh dataset behind a read-only
+command: `Error: dataset not found at /tmp/missing.lance (run `markq index <path>` first)`.)
+
 Same shape if the dataset was embedded with a model this binary doesn't
 know about:
 
 ```
-Error: dataset was built with embedder Some("some-other-model/Q4_K_M"), but this build only knows Qwen/Qwen3-Embedding-0.6B-GGUF/Q8_0
+Error: dataset was built with embedder some-other-model/Q4_K_M, but this build only knows Qwen/Qwen3-Embedding-0.6B-GGUF/Q8_0
 ```
 
 ## Use a throwaway dataset

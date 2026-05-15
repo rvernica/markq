@@ -1,8 +1,11 @@
 //! End-to-end embed + vector-search test, gated on `$MARKQ_TEST_MODEL`
-//! pointing to a Qwen3-Embedding-0.6B Q4_K_M GGUF. The model is multi-
-//! hundred-megabyte so we never download it from CI; run locally with:
+//! pointing to a `Qwen3-Embedding-0.6B-Q8_0.gguf` file (the exact filename
+//! `KnownModel::Qwen3Embedding06B.filename()` resolves to — `ensure_model`
+//! looks for that name inside `$MARKQ_MODELS_DIR`, so a differently named
+//! file would be invisible and trigger an HF download). The model is
+//! multi-hundred-megabyte so we never download it from CI; run locally with:
 //!
-//!   MARKQ_TEST_MODEL=/path/to/Qwen3-Embedding-0.6B-Q4_K_M.gguf \
+//!   MARKQ_TEST_MODEL=/path/to/Qwen3-Embedding-0.6B-Q8_0.gguf \
 //!     cargo test --test embed_vsearch_e2e -- --ignored
 //!
 //! When the env var is set, the test exercises the full pipeline: index
@@ -14,6 +17,7 @@ use markq_cli::indexer::run_index;
 use markq_cli::{embedder_cmd, search, vsearch};
 use markq_core::Index;
 use markq_index_lance::LanceIndex;
+use markq_inference::KnownModel;
 
 fn fixture_corpus() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/corpus")
@@ -30,6 +34,14 @@ async fn embed_then_vsearch_end_to_end() {
         model_path.exists(),
         "MARKQ_TEST_MODEL={} does not exist",
         model_path.display()
+    );
+    let expected_filename = KnownModel::Qwen3Embedding06B.filename();
+    assert_eq!(
+        model_path.file_name().and_then(|s| s.to_str()),
+        Some(expected_filename),
+        "MARKQ_TEST_MODEL must point at a file literally named {expected_filename}; \
+         `ensure_model` joins MARKQ_MODELS_DIR with that hardcoded name and will \
+         otherwise miss the local file and fall through to a Hugging Face download",
     );
     // Point markq's model cache at the directory holding the test model so
     // `ensure_model` reuses it instead of hitting Hugging Face.
