@@ -10,6 +10,7 @@ pub mod error;
 pub mod index;
 pub mod metadata;
 pub mod registry;
+pub mod rrf;
 pub mod schema;
 
 pub use error::{Error, Result};
@@ -19,6 +20,7 @@ pub use metadata::{
     KEY_LANCE_FILE_FORMAT_VERSION, KEY_LANCE_MANIFEST_VERSION, KEY_SCHEMA_VERSION, SCHEMA_VERSION,
 };
 pub use registry::{CollectionEntry, Registry};
+pub use rrf::{fuse, Contribution, FusedHit, FusionConfig};
 pub use schema::{
     chunk_arrow_schema, default_dataset_path, markq_home, ChunkColumn, EMBEDDING_DIM_DEFAULT,
 };
