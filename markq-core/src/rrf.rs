@@ -129,4 +129,40 @@ mod tests {
         let ids: Vec<&str> = fused.iter().map(|f| f.hit.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b", "c"]);
     }
+
+    #[test]
+    fn two_lists_hand_computed() {
+        // lex: [a, b, c]  vec: [b, a, d]
+        // cfg defaults: k=60, w_lex=0.75, w_vec=0.60, bonus=[0.05, 0.02, 0.02]
+        //
+        // a: lex rank 1 -> 0.75/61 + 0.05  = 0.01229508 + 0.05
+        //    vec rank 2 -> 0.60/62 + 0.02  = 0.00967742 + 0.02
+        // b: lex rank 2 -> 0.75/62 + 0.02  = 0.01209677 + 0.02
+        //    vec rank 1 -> 0.60/61 + 0.05  = 0.00983607 + 0.05
+        // c: lex rank 3 -> 0.75/63 + 0.02  = 0.01190476 + 0.02
+        // d: vec rank 3 -> 0.60/63 + 0.02  = 0.00952381 + 0.02
+        let lex = vec![hit("a"), hit("b"), hit("c")];
+        let vec_list = vec![hit("b"), hit("a"), hit("d")];
+        let cfg = FusionConfig::default();
+        let fused = fuse(&[("lex", &lex), ("vec", &vec_list)], &cfg);
+
+        let ids: Vec<&str> = fused.iter().map(|f| f.hit.id.as_str()).collect();
+        // a and b both appear in both lists; a is rank 1 in lex (heavier weight),
+        // b is rank 1 in vec. With w_lex > w_vec, a should outscore b.
+        assert_eq!(ids, vec!["a", "b", "c", "d"]);
+
+        let a = &fused[0];
+        let expected_a = 0.75 / 61.0 + 0.05 + 0.60 / 62.0 + 0.02;
+        assert!(
+            (a.final_score - expected_a).abs() < 1e-6,
+            "a final_score {} vs expected {}",
+            a.final_score,
+            expected_a,
+        );
+        assert_eq!(a.contributions.len(), 2);
+        assert_eq!(a.contributions[0].source, "lex");
+        assert_eq!(a.contributions[0].rank, 1);
+        assert_eq!(a.contributions[1].source, "vec");
+        assert_eq!(a.contributions[1].rank, 2);
+    }
 }
