@@ -4,10 +4,11 @@ This file covers what the binary actually does today. The current build
 ships the workspace skeleton, `markq inspect`, `markq index` (markdown
 walk + chunk + FTS index build), `markq search` (BM25 over the FTS
 index), `markq embed` (fills the embedding column via Qwen3-Embedding-
-0.6B Q8_0 over llama.cpp), and `markq vsearch` (cosine KNN over the
-HNSW vector index). Every other v1 subcommand is registered (so
-`markq --help` shows the final surface) but stubs out at runtime. Each
-will be lit up as the corresponding feature work lands.
+0.6B Q8_0 over llama.cpp), `markq vsearch` (cosine KNN over the HNSW
+vector index), and `markq query` (hybrid BM25 + vector retrieval fused
+with weighted Reciprocal Rank Fusion). Every other v1 subcommand is
+registered (so `markq --help` shows the final surface) but stubs out at
+runtime. Each will be lit up as the corresponding feature work lands.
 
 All output below was captured against the default dataset at
 `~/.markq/chunks.lance` after indexing this repo's `README.md`. Paths in
@@ -88,32 +89,19 @@ Per-subcommand help works even on stubs — useful for previewing the final
 flag surface:
 
 ```sh
-markq query --help
+markq rerank --help
 ```
 
 ```
-Hybrid retrieval (BM25 + vector + RRF)
+Hybrid retrieval + cross-encoder rerank
 
-Usage: markq query [OPTIONS] <QUERY>
-
-Arguments:
-  <QUERY>
-
-Options:
-  -c, --collection <COLLECTION>
-      --dataset <DATASET>        Path to the chunk dataset. Defaults to `~/.markq/chunks.lance`
-      --json
-      --files
-      --all
-  -n <TOP_K>                     [default: 10]
-      --min-score <MIN_SCORE>
-      --explain                  Per-stage timing + RRF contribution trace
+Usage: markq rerank [OPTIONS] <QUERY>
 ```
 
 Calling a stub fails fast with exit 1:
 
 ```sh
-markq query "anything"
+markq rerank "anything"
 ```
 
 ```
@@ -129,7 +117,8 @@ Error: not implemented yet
 | `search <query>` | ✅ Implemented (BM25 via Lance inverted index) |
 | `embed` | ✅ Implemented (Qwen3-Embedding-0.6B Q8_0, HNSW index build) |
 | `vsearch <query>` | ✅ Implemented (cosine KNN over the HNSW vector index) |
-| `query`, `rerank` | Stub (`not implemented yet`) |
+| `query <query>` | ✅ Implemented (BM25 + vector + weighted RRF; `--explain` available) |
+| `rerank` | Stub (`not implemented yet`) |
 | `get`, `multi-get`, `compact`, `doctor` | Stub |
 | `status`, `config` | Stub |
 | `collection {add,list,remove}` | Stub |
@@ -137,6 +126,7 @@ Error: not implemented yet
 | `watch`, `serve` | Stub |
 | `search --explain`, `search --collection <name>` | Returns a structured "not implemented" error |
 | `vsearch --explain`, `vsearch --collection <name>` | Same — recognized but gated |
+| `query --collection <name>` | Recognized but gated |
 
 ## `markq inspect`
 
@@ -376,8 +366,10 @@ is better, matching the BM25 convention. Values sit in `[-1, 1]` —
 unlike BM25 scores which are unbounded log-domain numbers.
 
 `--json`, `--files`, `-n`, `--min-score`, and `--all` all work the
-same as `markq search` (the formatters are shared). `--explain` and
-`-c/--collection` are recognized but gated (/ ).
+same as `markq search` (the formatters are shared). `--explain` is
+recognized but gated on `vsearch` — for explained retrieval, use
+`markq query --explain`. `-c/--collection` is gated until the
+multi-collection wiring lands.
 
 Running `vsearch` against a dataset without embeddings produces a clean
 error and does **not** load the model:
@@ -400,6 +392,107 @@ know about:
 
 ```
 Error: dataset was built with embedder some-other-model/Q4_K_M, but this build only knows Qwen/Qwen3-Embedding-0.6B-GGUF/Q8_0
+```
+
+## `markq query`
+
+Hybrid retrieval. Runs BM25 and vector KNN concurrently against the same
+dataset and fuses the two ranked lists with weighted Reciprocal Rank
+Fusion (RRF). Reuses the embedder recorded in
+`markq.embedder_model` — same model-validation guard as `vsearch`.
+
+```sh
+markq query --help
+```
+
+```
+Hybrid retrieval (BM25 + vector + RRF)
+
+Usage: markq query [OPTIONS] <QUERY>
+
+Arguments:
+  <QUERY>
+
+Options:
+  -c, --collection <COLLECTION>
+      --dataset <DATASET>        Path to the chunk dataset. Defaults to `~/.markq/chunks.lance`
+      --json
+      --files
+      --all
+  -n <TOP_K>                     [default: 10]
+      --min-score <MIN_SCORE>
+      --explain                  Per-stage timing + RRF contribution trace
+```
+
+```sh
+markq query "how does reranking work" -n 5
+```
+
+```
+  1.   0.072  markq://default/SYNTAX.md#6
+     Vec queries are natural language questions. No special syntax — just write what you're looking for. …
+  2.   0.071  markq://default/SYNTAX.md#2
+     | Type | Method | Description | |------|--------|-------------| | `lex` | BM25 | Keyword search with…
+  3.   0.041  markq://default/SYNTAX.md#7
+     Hyde queries are hypothetical answer passages (50-100 words). Write what you expect the answer to lo…
+  4.   0.041  markq://default/SYNTAX.md#5
+     ``` lex: CAP theorem consistency lex: "machine learning" -"deep learning" lex: auth -oauth -saml ```…
+  5.   0.041  markq://default/SYNTAX.md#10
+     - At most one `intent:` line per query document - `intent:` cannot appear alone — at least one `lex:…
+```
+
+The score column is the **fused RRF score**, not BM25 or cosine. It is
+the weighted sum of `weight / (k + rank)` over the two source lists,
+plus a small bonus for ranks 1–3. Defaults: `k=60`, `weight_lex=0.75`,
+`weight_vec=0.60`, top-3 bonus `[+0.05, +0.02, +0.02]`. Absolute values
+have no meaning across queries — only the within-query ordering does.
+
+`--json`, `--files`, `-n`, `--min-score`, and `--all` behave identically
+to `markq search` and `markq vsearch`.
+
+### `--explain`
+
+`--explain` writes a per-stage timing summary plus a contribution table
+to **stderr**, leaving stdout free for piping (`--files | xargs`,
+`--json | jq`):
+
+```sh
+markq query "how does reranking work" --explain -n 5 2> trace.txt
+cat trace.txt
+```
+
+```
+bm25:   10 hits in 128ms
+embed:  query in 128ms
+vector: 13 hits in 15ms
+fuse:   13 unique docs in 0ms
+
+rank  id               final      lex(rank,w)      vec(rank,w)   bonus
+1     d0bd2b3da7b7    0.0716       ( 4, 0.75)       ( 1, 0.60)    0.05
+2     5affe2beb176    0.0711       ( 1, 0.75)       ( 8, 0.60)    0.05
+3     720f9224cbc3    0.0412       ( 5, 0.75)       ( 2, 0.60)    0.02
+4     ed131760dd53    0.0410       ( 3, 0.75)       ( 6, 0.60)    0.02
+5     293d42518fc3    0.0406       ( 8, 0.75)       ( 3, 0.60)    0.02
+```
+
+The two retrievers are issued concurrently via `tokio::join!`, so the
+wall-clock cost of `bm25` and `embed` overlaps; `vector` runs after the
+embedder produces a vector. `fuse` runs in-process and is typically
+sub-millisecond. `lex(rank,w)` is the document's 1-based rank in the
+BM25 list and the configured weight; missing means the document didn't
+appear there (`(  - ,   - )`). Same shape for `vec`. `bonus` is the
+top-rank bonus contribution (0 if the document was ranked 4+ in every
+list).
+
+The fetch depth before fusion is `max(-n, 20)` — we over-fetch a bit
+from each side so the fused top-k has real candidates even when the two
+lists disagree near the head.
+
+A query against a dataset without embeddings fails the same way
+`vsearch` does, with no model load:
+
+```
+Error: no embeddings in this dataset; run `markq embed` first to populate them
 ```
 
 ## Use a throwaway dataset
