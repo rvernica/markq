@@ -462,9 +462,9 @@ cat trace.txt
 ```
 
 ```
-bm25:   10 hits in 128ms
-embed:  query in 128ms
-vector: 13 hits in 15ms
+bm25:   10 hits in 20ms
+embed:  query in 120ms
+vector: 13 hits in 12ms
 fuse:   13 unique docs in 0ms
 
 rank  id               final      lex(rank,w)      vec(rank,w)   bonus
@@ -475,18 +475,19 @@ rank  id               final      lex(rank,w)      vec(rank,w)   bonus
 5     293d42518fc3    0.0406       ( 8, 0.75)       ( 3, 0.60)    0.02
 ```
 
-The two retrievers are issued concurrently via `tokio::join!`, so the
-wall-clock cost of `bm25` and `embed` overlaps; `vector` runs after the
-embedder produces a vector. `fuse` runs in-process and is typically
-sub-millisecond. `lex(rank,w)` is the document's 1-based rank in the
+`bm25` and `embed` are each timed inside their own future and the two are
+issued concurrently via `tokio::join!`, so on a multi-core machine the
+wall-clock cost is roughly `max(bm25, embed)` even though each line
+reports its own duration. `vector` runs after the embedder produces a
+vector. `fuse` runs in-process and is typically sub-millisecond. `lex(rank,w)` is the document's 1-based rank in the
 BM25 list and the configured weight; missing means the document didn't
 appear there (`(  - ,   - )`). Same shape for `vec`. `bonus` is the
 top-rank bonus contribution (0 if the document was ranked 4+ in every
 list).
 
-The fetch depth before fusion is `max(-n, 20)` — we over-fetch a bit
-from each side so the fused top-k has real candidates even when the two
-lists disagree near the head.
+The fetch depth before fusion is `max(2 * -n, 20)` — each side is
+over-fetched so the fused top-k has real candidates when the two lists
+disagree near the head, with a floor of 20 for very small `-n`.
 
 A query against a dataset without embeddings fails the same way
 `vsearch` does, with no model load:

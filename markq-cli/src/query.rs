@@ -29,11 +29,12 @@ pub struct QueryOutcome {
     pub explain: Option<ExplainTrace>,
 }
 
-/// Pre-fusion fetch depth. The two retrieval lists are over-fetched so the
-/// fused top-k has real candidates from both sides even when the lists
-/// disagree near the head.
+/// Pre-fusion fetch depth. Over-fetches each retrieval list so the fused
+/// top-k has real candidates from both sides when the lists disagree near
+/// the head. Doubles the requested `k` with a floor of 20, so small queries
+/// still get a meaningful margin and large queries keep one.
 fn pre_fusion_k(k: usize) -> usize {
-    k.max(20)
+    k.saturating_mul(2).max(20)
 }
 
 pub async fn run_query(
@@ -68,16 +69,17 @@ pub async fn run_query(
 
     let k_pre = pre_fusion_k(k);
 
-    let bm25_t = Instant::now();
-    let bm25_fut = idx.bm25(query, k_pre, None);
-
-    let embed_t = Instant::now();
-    let embed_fut = embedder.embed(query.to_string());
-
-    // Run BM25 and (embed -> vector) concurrently.
-    let (bm25_res, embed_res) = tokio::join!(bm25_fut, embed_fut);
-    let bm25_ms = bm25_t.elapsed().as_millis();
-    let embed_ms = embed_t.elapsed().as_millis();
+    let bm25_fut = async {
+        let t = Instant::now();
+        let r = idx.bm25(query, k_pre, None).await;
+        (r, t.elapsed().as_millis())
+    };
+    let embed_fut = async {
+        let t = Instant::now();
+        let r = embedder.embed(query.to_string()).await;
+        (r, t.elapsed().as_millis())
+    };
+    let ((bm25_res, bm25_ms), (embed_res, embed_ms)) = tokio::join!(bm25_fut, embed_fut);
     let bm25_hits = bm25_res.context("bm25 search")?;
     let q_vec = embed_res.context("embed query")?;
 
