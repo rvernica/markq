@@ -14,8 +14,6 @@ use markq_inference::{ensure_model, Embedder, KnownModel};
 
 use crate::search::{apply_filters, SearchOptions};
 
-/// Per-stage timing and post-fusion trace, populated only when the CLI
-/// passed `--explain`.
 pub struct ExplainTrace {
     pub bm25_hits: usize,
     pub bm25_ms: u128,
@@ -23,7 +21,6 @@ pub struct ExplainTrace {
     pub vector_hits: usize,
     pub vector_ms: u128,
     pub fuse_ms: u128,
-    /// Full fused list pre-truncation, for the trace table.
     pub fused: Vec<FusedHit>,
 }
 
@@ -32,26 +29,146 @@ pub struct QueryOutcome {
     pub explain: Option<ExplainTrace>,
 }
 
+/// Pre-fusion fetch depth. The two retrieval lists are over-fetched so the
+/// fused top-k has real candidates from both sides even when the lists
+/// disagree near the head.
+fn pre_fusion_k(k: usize) -> usize {
+    k.max(20)
+}
+
 pub async fn run_query(
-    _idx: &LanceIndex,
-    _query: &str,
-    _k: usize,
-    _opts: &SearchOptions,
-    _explain: bool,
+    idx: &LanceIndex,
+    query: &str,
+    k: usize,
+    opts: &SearchOptions,
+    explain: bool,
 ) -> Result<QueryOutcome> {
-    anyhow::bail!("not yet implemented");
+    let md = idx.metadata().await.context("read dataset metadata")?;
+    if md.embedder_model.is_none() || md.embedder_dim.is_none() {
+        anyhow::bail!("no embeddings in this dataset; run `markq embed` first to populate them");
+    }
+    let model = KnownModel::Qwen3Embedding06B;
+    let existing = md
+        .embedder_model
+        .as_deref()
+        .expect("guarded by is_none() check above");
+    if existing != model.id() {
+        anyhow::bail!(
+            "dataset was built with embedder {existing}, but this build only knows {}",
+            model.id()
+        );
+    }
+
+    let model_path = ensure_model(model).await.context("locate embedder model")?;
+    #[cfg(any(feature = "vulkan", feature = "cuda"))]
+    let n_gpu_layers: u32 = 999;
+    #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
+    let n_gpu_layers: u32 = 0;
+    let embedder = Embedder::load(&model_path, n_gpu_layers).context("load embedder")?;
+
+    let k_pre = pre_fusion_k(k);
+
+    let bm25_t = Instant::now();
+    let bm25_fut = idx.bm25(query, k_pre, None);
+
+    let embed_t = Instant::now();
+    let embed_fut = embedder.embed(query.to_string());
+
+    // Run BM25 and (embed -> vector) concurrently.
+    let (bm25_res, embed_res) = tokio::join!(bm25_fut, embed_fut);
+    let bm25_ms = bm25_t.elapsed().as_millis();
+    let embed_ms = embed_t.elapsed().as_millis();
+    let bm25_hits = bm25_res.context("bm25 search")?;
+    let q_vec = embed_res.context("embed query")?;
+
+    let vec_t = Instant::now();
+    let vec_hits = idx
+        .vector(&q_vec, k_pre, None)
+        .await
+        .context("vector search")?;
+    let vector_ms = vec_t.elapsed().as_millis();
+
+    let fuse_t = Instant::now();
+    let cfg = FusionConfig::default();
+    let fused = fuse(&[("lex", &bm25_hits), ("vec", &vec_hits)], &cfg);
+    let fuse_ms = fuse_t.elapsed().as_millis();
+
+    let as_hits: Vec<ChunkHit> = fused
+        .iter()
+        .map(|f| ChunkHit {
+            score: f.final_score,
+            ..f.hit.clone()
+        })
+        .collect();
+    let filtered = apply_filters(as_hits, opts);
+
+    let explain_trace = if explain {
+        Some(ExplainTrace {
+            bm25_hits: bm25_hits.len(),
+            bm25_ms,
+            embed_ms,
+            vector_hits: vec_hits.len(),
+            vector_ms,
+            fuse_ms,
+            fused,
+        })
+    } else {
+        None
+    };
+
+    Ok(QueryOutcome {
+        hits: filtered,
+        explain: explain_trace,
+    })
 }
 
-pub fn write_explain<W: Write>(_w: &mut W, _trace: &ExplainTrace, _shown: &[ChunkHit]) -> Result<()> {
-    Ok(())
-}
+pub fn write_explain<W: Write>(w: &mut W, trace: &ExplainTrace, shown: &[ChunkHit]) -> Result<()> {
+    writeln!(w, "bm25:   {} hits in {}ms", trace.bm25_hits, trace.bm25_ms)?;
+    writeln!(w, "embed:  query in {}ms", trace.embed_ms)?;
+    writeln!(
+        w,
+        "vector: {} hits in {}ms",
+        trace.vector_hits, trace.vector_ms
+    )?;
+    writeln!(
+        w,
+        "fuse:   {} unique docs in {}ms",
+        trace.fused.len(),
+        trace.fuse_ms
+    )?;
+    writeln!(w)?;
+    writeln!(
+        w,
+        "{:<4}  {:<12}  {:>8}  {:>15}  {:>15}  {:>6}",
+        "rank", "id", "final", "lex(rank,w)", "vec(rank,w)", "bonus"
+    )?;
 
-// Bring the inference crate in only to keep the imports honest until
-// `run_query` lands; the warning will go away in Task 7.
-#[allow(dead_code)]
-fn _force_use(_: KnownModel, _: Embedder) {}
-#[allow(dead_code)]
-async fn _force_ensure(m: KnownModel) -> Result<()> {
-    let _ = ensure_model(m).await.context("locate embedder model")?;
+    let mut by_id = std::collections::HashMap::new();
+    for f in &trace.fused {
+        by_id.insert(f.hit.id.clone(), f);
+    }
+
+    for (i, h) in shown.iter().enumerate() {
+        let Some(f) = by_id.get(&h.id) else { continue };
+        let cell = |source: &str| -> String {
+            f.contributions
+                .iter()
+                .find(|c| c.source == source)
+                .map(|c| format!("({:>2}, {:.2})", c.rank, c.weight))
+                .unwrap_or_else(|| "(  - ,   - )".to_string())
+        };
+        let bonus_total: f32 = f.contributions.iter().map(|c| c.bonus).sum();
+        let id_short: String = h.id.chars().take(12).collect();
+        writeln!(
+            w,
+            "{:<4}  {:<12}  {:>8.4}  {:>15}  {:>15}  {:>6.2}",
+            i + 1,
+            id_short,
+            f.final_score,
+            cell("lex"),
+            cell("vec"),
+            bonus_total,
+        )?;
+    }
     Ok(())
 }
