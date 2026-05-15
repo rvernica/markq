@@ -29,7 +29,10 @@ pub async fn run_vsearch(
     }
 
     let model = KnownModel::Qwen3Embedding06B;
-    let existing = md.embedder_model.as_deref().expect("guarded by is_none() check above");
+    let existing = md
+        .embedder_model
+        .as_deref()
+        .expect("guarded by is_none() check above");
     if existing != model.id() {
         anyhow::bail!(
             "dataset was built with embedder {existing}, but this build only knows {}",
