@@ -190,4 +190,29 @@ mod tests {
         assert_eq!(fused[0].contributions.len(), 1);
         assert_eq!(fused[0].contributions[0].source, "lex");
     }
+
+    #[test]
+    fn rank_one_in_both_beats_rank_one_in_only_one() {
+        // `both` is rank 1 in both lists. `only_lex` is rank 1 in lex but
+        // absent from vec. With positive weights for both sources, `both`
+        // must outscore `only_lex`.
+        let lex = vec![hit("both"), hit("only_lex")];
+        let vec_list = vec![hit("both"), hit("filler")];
+        let cfg = FusionConfig::default();
+        let fused = fuse(&[("lex", &lex), ("vec", &vec_list)], &cfg);
+
+        let score = |id: &str| {
+            fused
+                .iter()
+                .find(|f| f.hit.id == id)
+                .map(|f| f.final_score)
+                .expect("present")
+        };
+        assert!(
+            score("both") > score("only_lex"),
+            "both={} vs only_lex={}",
+            score("both"),
+            score("only_lex"),
+        );
+    }
 }
