@@ -444,8 +444,10 @@ markq query "how does reranking work" -n 5
 The score column is the **fused RRF score**, not BM25 or cosine. It is
 the weighted sum of `weight / (k + rank)` over the two source lists,
 plus a small bonus for ranks 1–3. Defaults: `k=60`, `weight_lex=0.75`,
-`weight_vec=0.60`, top-3 bonus `[+0.05, +0.02, +0.02]`. Absolute values
-have no meaning across queries — only the within-query ordering does.
+`weight_vec=0.60`, top-3 bonus `[+0.05, +0.02, +0.02]`. These constants
+are not currently exposed as CLI flags — tuning lives in
+`FusionConfig::default()` in `markq-core`. Absolute values have no
+meaning across queries — only the within-query ordering does.
 
 `--json`, `--files`, `-n`, `--min-score`, and `--all` behave identically
 to `markq search` and `markq vsearch`.

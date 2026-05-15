@@ -46,7 +46,9 @@ async fn hybrid_query_fuses_lex_and_vec() {
         .expect("embed");
     assert!(embed_report.rows >= 3);
 
-    // Reopen so the FTS index is fresh.
+    // LanceDB reads a snapshot at open time; the BM25 / FTS index built
+    // during `run_index` (and the embeddings written during `run_embed`)
+    // are not visible to the existing handle. Reopen to pick them up.
     let idx = LanceIndex::open(&dataset).await.expect("reopen");
 
     let opts = search::SearchOptions {
@@ -60,9 +62,11 @@ async fn hybrid_query_fuses_lex_and_vec() {
     assert!(!outcome.hits.is_empty(), "expected at least one fused hit");
     let trace = outcome.explain.expect("explain trace");
     assert!(trace.bm25_hits >= 1, "bm25 should match some terms");
-    assert!(
-        trace.vector_hits >= 1,
-        "vector should always return up to k"
+    // Each of the 3 fixture files produces exactly one chunk; the vector
+    // KNN returns every chunk in the dataset because k_pre exceeds 3.
+    assert_eq!(
+        trace.vector_hits, 3,
+        "vector should return every chunk in the 3-doc corpus",
     );
 
     // The top hit should be `beta.md` — it's the only doc with both the
