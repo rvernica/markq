@@ -213,4 +213,50 @@ mod tests {
             score("only_lex"),
         );
     }
+
+    #[test]
+    fn rank_one_bonus_accumulates_per_source() {
+        // A doc at rank 1 in both lists earns the rank-1 bonus twice
+        // (once per source contribution). With defaults (0.05, 0.05) the
+        // bonus total on the fused hit must be 0.10.
+        let lex = vec![hit("x")];
+        let vec_list = vec![hit("x")];
+        let cfg = FusionConfig::default();
+        let fused = fuse(&[("lex", &lex), ("vec", &vec_list)], &cfg);
+        assert_eq!(fused.len(), 1);
+        let total_bonus: f32 = fused[0].contributions.iter().map(|c| c.bonus).sum();
+        assert!(
+            (total_bonus - 0.10).abs() < 1e-6,
+            "expected bonus 0.10, got {total_bonus}",
+        );
+    }
+
+    #[test]
+    fn equal_final_score_breaks_ties_by_id_ascending() {
+        // Two docs with the same final_score must sort by id ascending,
+        // regardless of HashMap iteration order. Build a config where the
+        // two sources are weighted identically and feed each doc at the
+        // same rank in its own source — final_score collides exactly.
+        let mut weights = std::collections::BTreeMap::new();
+        weights.insert("lex", 0.5);
+        weights.insert("vec", 0.5);
+        let cfg = FusionConfig {
+            k: 60,
+            weights,
+            top_rank_bonus: [0.0, 0.0, 0.0],
+        };
+        let lex = vec![hit("z_late")];
+        let vec_list = vec![hit("a_early")];
+        let fused = fuse(&[("lex", &lex), ("vec", &vec_list)], &cfg);
+
+        assert_eq!(fused.len(), 2);
+        assert!(
+            (fused[0].final_score - fused[1].final_score).abs() < 1e-6,
+            "scores should tie: {} vs {}",
+            fused[0].final_score,
+            fused[1].final_score,
+        );
+        assert_eq!(fused[0].hit.id, "a_early");
+        assert_eq!(fused[1].hit.id, "z_late");
+    }
 }
