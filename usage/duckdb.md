@@ -341,6 +341,216 @@ LIMIT 10;
 "
 ```
 
+## Vector search end-to-end: embed in one tool, query in DuckDB
+
+`lance_vector_search(<dataset>, <column>, <query vector>, k := <N>)` runs
+HNSW vector search inside DuckDB and returns the same chunks `markq
+vsearch` would. The wrinkle is that DuckDB does not run the embedder
+itself — you have to hand it a 1024-float query vector that came from
+somewhere else. Three ways to produce that vector, all interchangeable
+for retrieval (cosine ≈ 0.9998 between any pair on the same query,
+inside llama.cpp's own run-to-run noise floor).
+
+### Embed the query with `markq embed-query`
+
+`markq embed-query "<text>"` prints the query embedding as a one-line
+JSON array (1024 floats) on stdout, ready to be spliced into SQL. It
+uses the exact same `Embedder::load` + `embedder.embed` path as `markq
+vsearch`, so the vector is cosine-compatible with what's in the
+dataset by construction.
+
+```sh
+# Capture the query vector once.
+QVEC=$(markq embed-query "how does retrieval work")
+
+# Splice it straight into lance_vector_search.
+~/.duckdb/cli/1.5.0/duckdb -c "
+LOAD lance;
+SELECT chunk_index, _distance, substr(text, 1, 60) AS preview
+FROM lance_vector_search('$HOME/.markq/chunks.lance', 'embedding',
+                         $QVEC::FLOAT[1024], k := 3);
+"
+```
+
+```
+┌─────────────┬───────────┬──────────────────────────────────────────────────────────────────┐
+│ chunk_index │ _distance │                             preview                              │
+│    int32    │   float   │                             varchar                              │
+├─────────────┼───────────┼──────────────────────────────────────────────────────────────────┤
+│           0 │ 0.9712044 │ # markq\n\n`markq` (mark[down] + q[uery]) is a local-first Rus   │
+│           6 │ 1.3101343 │ ```sh\ncargo run -q -p markq-cli -- inspect\n```\n\nCreates `~/. │
+│           5 │ 1.3734075 │ A tracked `pre-commit` hook in `.githooks/` runs `cargo fmt      │
+└─────────────┴───────────┴──────────────────────────────────────────────────────────────────┘
+```
+
+`_distance` is cosine distance (lower is better); the top hit is the
+README's intro chunk, which is on-topic for "how does retrieval work".
+This matches the ranking `markq vsearch "how does retrieval work" -n 3`
+would produce — same embedder, same KNN, just driven from SQL.
+
+A few practical notes:
+
+- The JSON array `markq embed-query` prints is valid DuckDB list syntax,
+  so the `$QVEC::FLOAT[1024]` cast is the only ceremony you need.
+- `markq embed-query` validates the dataset's recorded `embedder_model`
+  before loading the GGUF, so this composition fails loudly if the
+  dataset was built with a different embedder rather than returning a
+  silently incompatible vector.
+- Use `--full-text` style hybrid query in `markq query` if you want
+  BM25 + vector fused; this path is vector-only.
+
+### Embed the query with `llama-embedding`
+
+`llama-embedding` is the standalone one-shot CLI bundled with llama.cpp.
+It reads the same GGUF and runs the same inference, so the vectors are
+interchangeable with markq's for retrieval (we measured cosine
+similarity ≈ 0.9998 between them, well inside llama.cpp's own
+run-to-run noise floor).
+
+The one thing to be careful about: `llama-embedding` defaults to L2-
+normalizing the output. Markq does not, and Lance stores un-normalized
+vectors, so pass `--embd-normalize -1` to get the raw vector.
+
+```sh
+# Start by pointing at your local llama.cpp build.
+LLAMA_BIN=/path/to/llama.cpp/build/bin/llama-embedding
+
+QVEC=$("$LLAMA_BIN" \
+    --model ~/.cache/markq/models/Qwen3-Embedding-0.6B-Q8_0.gguf \
+    --pooling last \
+    --embd-normalize -1 \
+    --embd-output-format json \
+    --ctx-size 2048 \
+    --n-gpu-layers 999 \
+    --prompt "how does retrieval work" 2>/dev/null \
+  | python3 -c "import json, sys; print(json.dumps(json.load(sys.stdin)['data'][0]['embedding']))")
+
+~/.duckdb/cli/1.5.0/duckdb -c "
+LOAD lance;
+SELECT chunk_index, _distance, substr(text, 1, 60) AS preview
+FROM lance_vector_search('$HOME/.markq/chunks.lance', 'embedding',
+                         $QVEC::FLOAT[1024], k := 3);
+"
+```
+
+```
+┌─────────────┬────────────┬──────────────────────────────────────────────────────────────────┐
+│ chunk_index │ _distance  │                             preview                              │
+│    int32    │   float    │                             varchar                              │
+├─────────────┼────────────┼──────────────────────────────────────────────────────────────────┤
+│           0 │ 0.97111356 │ # markq\n\n`markq` (mark[down] + q[uery]) is a local-first Rus   │
+│           6 │  1.3074002 │ ```sh\ncargo run -q -p markq-cli -- inspect\n```\n\nCreates `~/. │
+│           5 │  1.3708969 │ A tracked `pre-commit` hook in `.githooks/` runs `cargo fmt      │
+└─────────────┴────────────┴──────────────────────────────────────────────────────────────────┘
+```
+
+Same top-3, `_distance` values match `markq embed-query`'s to three
+decimal places — the per-component drift between markq and llama.cpp's
+matmul/attention path is too small to change retrieval order.
+
+What each flag is for:
+
+| Flag | Why |
+|---|---|
+| `--model` | The GGUF to use. Must be the same model `markq embed` recorded; check `markq inspect` for `embedder_model`. |
+| `--pooling last` | Match markq. Qwen3-Embedding declares this in its GGUF metadata, but pin it. |
+| `--embd-normalize -1` | Return the raw vector. Default is `2` (L2-normalized) which works for cosine search but no longer matches markq's stored vectors element-wise. |
+| `--embd-output-format json` | Single OpenAI-style JSON envelope; the small python step peels off `data[0].embedding`. |
+| `--ctx-size 2048` | Match markq's `DEFAULT_N_CTX`. |
+| `--n-gpu-layers 999` | Offload every layer to GPU when llama.cpp was built with Vulkan/Metal/CUDA. Drop or set 0 for CPU. |
+
+Add `--device Vulkan1` (or whichever device id) if your build needs
+explicit device selection.
+
+### Embed the query with `llama-server`
+
+`llama-server` is the long-lived HTTP version of the same llama.cpp
+inference code that `llama-embedding` runs one-shot. Use it when you'll
+issue many queries in a row — the 3–4 second GGUF load + GPU init cost
+is paid once, not per query.
+
+Start the server in embedding mode (long-form flags throughout):
+
+```sh
+LLAMA_BIN=/path/to/llama.cpp/build/bin/llama-server
+
+"$LLAMA_BIN" \
+    --model ~/.cache/markq/models/Qwen3-Embedding-0.6B-Q8_0.gguf \
+    --embedding \
+    --pooling last \
+    --ctx-size 2048 \
+    --n-gpu-layers 999 \
+    --device Vulkan1 \
+    --port 8080
+```
+
+The server normalizes the embedding to unit length by default (no CLI
+knob to change this — at least not in the build I tested). The
+per-request body has an `embd_normalize` field that overrides it; pass
+`-1` to get the raw vector that matches markq's stored vectors
+element-wise.
+
+```sh
+QVEC=$(curl -sS http://127.0.0.1:8080/embedding \
+    -H 'Content-Type: application/json' \
+    -d '{"content": "how does retrieval work", "embd_normalize": -1}' \
+  | python3 -c "import json, sys; print(json.dumps(json.load(sys.stdin)[0]['embedding'][0]))")
+
+~/.duckdb/cli/1.5.0/duckdb -c "
+LOAD lance;
+SELECT chunk_index, _distance, substr(text, 1, 60) AS preview
+FROM lance_vector_search('$HOME/.markq/chunks.lance', 'embedding',
+                         $QVEC::FLOAT[1024], k := 3);
+"
+```
+
+```
+┌─────────────┬────────────┬──────────────────────────────────────────────────────────────────┐
+│ chunk_index │ _distance  │                             preview                              │
+│    int32    │   float    │                             varchar                              │
+├─────────────┼────────────┼──────────────────────────────────────────────────────────────────┤
+│           0 │ 0.97111356 │ # markq\n\n`markq` (mark[down] + q[uery]) is a local-first Rus   │
+│           6 │  1.3074002 │ ```sh\ncargo run -q -p markq-cli -- inspect\n```\n\nCreates `~/. │
+│           5 │  1.3708969 │ A tracked `pre-commit` hook in `.githooks/` runs `cargo fmt      │
+└─────────────┴────────────┴──────────────────────────────────────────────────────────────────┘
+```
+
+Identical top-3 to the `llama-embedding` block above and to
+`markq embed-query`'s `_distance` values to three decimals.
+
+Endpoint and response notes:
+
+- **`/embedding`** returns `[{"index": 0, "embedding": [[v0, v1, ...]]}]`
+  — an outer list (one item per input), each with the embedding wrapped
+  in *another* list. The double-wrap is so the same shape carries the
+  per-token outputs when `pooling: none`. With `pooling: last` you only
+  ever need `[0]['embedding'][0]`.
+- **`/v1/embeddings`** is the OpenAI-compatible endpoint and gives
+  `{"data": [{"embedding": [...]}]}` — flat vector, no double-wrap.
+  Either works.
+- **`embd_normalize` values:** `-1` raw, `0` max-absolute, `1` L1, `2`
+  L2 (default), `>2` p-norm. Mirror of `llama-embedding --embd-normalize`.
+- Forgetting `embd_normalize: -1` is the most common pitfall. The
+  response *looks* fine (1024 floats), but every component is divided
+  by the original norm. Cosine search against Lance's IVF/HNSW index
+  still ranks correctly because cosine is normalization-invariant, but
+  `_distance` values diverge from what `markq vsearch` reports, and
+  any downstream code that does `vec[i] * scale` is off by ~85×.
+
+When to pick which:
+
+- **`markq embed-query`** — already in the markq binary, no second
+  install. Best when you've decided markq is the embedding source of
+  truth and you're scripting around the dataset it built.
+- **`llama-embedding`** — one-shot CLI, no server lifecycle. Best for
+  cross-implementation parity testing, or when the dataset was built
+  outside markq and you don't want to thread the embedder model id
+  through markq's metadata guard.
+- **`llama-server`** — keeps the model loaded across calls. Best when
+  many queries are coming in a row, when an MCP / agent / UI wants a
+  network-reachable embedder, or when the same model serves both this
+  embedder role and chat/completion to other clients.
+
 ## See also
 
 - [`usage/markq.md`](markq.md) — the markq CLI itself.
