@@ -396,8 +396,8 @@ A few practical notes:
   before loading the GGUF, so this composition fails loudly if the
   dataset was built with a different embedder rather than returning a
   silently incompatible vector.
-- Use `--full-text` style hybrid query in `markq query` if you want
-  BM25 + vector fused; this path is vector-only.
+- Run `markq query "<text>"` directly if you want BM25 + vector fused
+  (it's already hybrid); the SQL path here is vector-only.
 
 ### Embed the query with `llama-embedding`
 
