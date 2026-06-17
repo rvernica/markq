@@ -56,9 +56,8 @@ subcommands are registered in the `clap` surface and exit with a structured
 ## Build
 
 Stable Rust toolchain; building from source needs a C++ compiler and
-CMake (for `llama-cpp-sys-2`'s vendored llama.cpp — no-op for the current
-build because `markq-inference` is a stub, but the dependency is in the
-graph for forward compatibility).
+CMake (for `llama-cpp-sys-2`'s vendored llama.cpp, which `markq-inference`
+builds and links for the embedder).
 
 ```sh
 cargo build --release -p markq-cli
@@ -73,7 +72,8 @@ differs.
 ### Git hooks
 
 A tracked `pre-commit` hook in `.githooks/` runs `cargo fmt --all -- --check`
-on commits that touch `*.rs`. Enable it once per clone:
+and blocks the commit if any Rust code isn't formatted. Enable it once per
+clone:
 
 ```sh
 git config core.hooksPath .githooks
