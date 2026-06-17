@@ -250,10 +250,7 @@ async fn cmd_embed(dataset_path: &std::path::Path, args: &EmbedArgs) -> Result<(
     Ok(())
 }
 
-async fn cmd_embed_query(
-    dataset_path: &std::path::Path,
-    args: &EmbedQueryArgs,
-) -> Result<()> {
+async fn cmd_embed_query(dataset_path: &std::path::Path, args: &EmbedQueryArgs) -> Result<()> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     embed_query::run_embed_query(dataset_path, &args.query, &mut out).await

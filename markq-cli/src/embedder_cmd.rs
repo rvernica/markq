@@ -37,8 +37,7 @@ pub async fn run_embed(idx: &LanceIndex) -> Result<EmbedReport> {
         .await
         .context("download / locate embedder model")?;
 
-    let embedder =
-        Embedder::load(&model_path, default_n_gpu_layers()).context("load embedder")?;
+    let embedder = Embedder::load(&model_path, default_n_gpu_layers()).context("load embedder")?;
     let dim = embedder.dim();
     info!(model = model.id(), dim, "embedder ready");
 

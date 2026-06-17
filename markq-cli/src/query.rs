@@ -61,8 +61,7 @@ pub async fn run_query(
     }
 
     let model_path = ensure_model(model).await.context("locate embedder model")?;
-    let embedder =
-        Embedder::load(&model_path, default_n_gpu_layers()).context("load embedder")?;
+    let embedder = Embedder::load(&model_path, default_n_gpu_layers()).context("load embedder")?;
 
     let k_pre = pre_fusion_k(k);
 
