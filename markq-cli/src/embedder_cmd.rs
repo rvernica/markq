@@ -98,11 +98,16 @@ pub async fn run_embed(idx: &LanceIndex) -> Result<EmbedReport> {
     // `merge_insert`, which rewrites every row into fresh fragments, so the
     // FTS index built at index time would otherwise be left covering dead
     // rows and BM25 retrieval would collapse.
+    //
+    // Rebuild FTS *before* the vector index: it's the BM25-critical one and
+    // far cheaper than IVF training, so a vector-rebuild failure (e.g.
+    // degenerate IVF on a tiny corpus) can't leave a freshly-embedded dataset
+    // with a stale FTS index.
     if total_rows > 0 {
+        idx.rebuild_fts_index().await.context("rebuild FTS index")?;
         idx.rebuild_vector_index()
             .await
             .context("rebuild vector index")?;
-        idx.rebuild_fts_index().await.context("rebuild FTS index")?;
     }
 
     Ok(EmbedReport {

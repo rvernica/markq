@@ -174,9 +174,10 @@ async fn embed_then_vsearch_end_to_end() {
 ///
 /// Reproducing this needs a corpus with *diverse* per-chunk text: uniform text
 /// yields near-identical embeddings, degenerate IVF training, and the bug does
-/// not surface. We generate ~360 diverse chunks (the real-world corpus that
-/// first exposed this was ~740) and assert the BM25 hit count for a planted
-/// common term survives the embed pass.
+/// not surface. The chunker emits one chunk per heading section, so 60 files ×
+/// 6 sections yields ~360 chunks (observed; the real-world corpus that first
+/// exposed this was ~740) — comfortably clear of the `> 100` floor below. We
+/// assert the BM25 hit count for a planted common term survives the embed pass.
 #[tokio::test]
 #[ignore = "requires MARKQ_TEST_MODEL pointing at a Qwen3-Embedding GGUF"]
 async fn bm25_survives_embed() {
