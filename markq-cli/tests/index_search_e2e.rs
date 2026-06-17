@@ -1,6 +1,5 @@
-//! end-to-end test: index a 10-file fixture, search, assert
-//! known queries return known files at known ranks. This is the spec
-//! check from `the plan` § — Tests.
+//! End-to-end test: index a 10-file fixture, search, assert known queries
+//! return known files at known ranks.
 
 use std::path::PathBuf;
 
@@ -69,8 +68,8 @@ async fn search_on_empty_index_returns_empty() {
 
 #[tokio::test]
 async fn bm25_score_monotonicity_under_term_repetition() {
-    // the plan: doubling a term frequency in a doc raises that doc's
-    // score (or holds — never drops). We construct a 2-doc corpus where
+    // Doubling a term frequency in a doc raises that doc's score (or
+    // holds — never drops). We construct a 2-doc corpus where
     // doc A mentions "widgetron" once and doc B mentions it five times,
     // and assert B outscores A.
     let dir = tempfile::tempdir().unwrap();

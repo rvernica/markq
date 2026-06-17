@@ -1,6 +1,6 @@
-//! LanceDB-backed `Index` implementation. covers open/create + the
-//! metadata write that PHASE1_FOLLOWUPS.md item #4 calls for; query methods
-//! are wired in (BM25), (vector), (hybrid).
+//! LanceDB-backed `Index` implementation: open/create plus the metadata write
+//! that PHASE1_FOLLOWUPS.md item #4 calls for, and the BM25, vector, and
+//! hybrid query methods.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -61,8 +61,8 @@ impl LanceIndex {
     }
 
     /// Same as `open_or_create` but lets callers (e.g. tests) override the
-    /// embedding dim. Production code should use the default until 
-    /// wires per-embedder dim into config.
+    /// embedding dim. Production code should use the default until per-embedder
+    /// dim is wired into config.
     pub async fn open_or_create_with_dim(dataset_path: &Path, embedding_dim: i32) -> Result<Self> {
         // LanceDB's `connect(uri)` opens a *database directory* that holds
         // many tables; each table lives at `<uri>/<table_name>.lance/`. We
@@ -296,8 +296,8 @@ fn embedding_dim_from_schema(schema: &SchemaRef) -> Result<u32> {
 
 async fn ensure_vector_index(table: &Table) -> Result<()> {
     // IvfHnswSq with Cosine matches the `vector()` query path. Like the FTS
-    // path, we create-or-replace per call; will gate behind
-    // fragmentation thresholds. Defaults (m=20, ef_construction=300) match
+    // path, we create-or-replace per call; gating behind fragmentation
+    // thresholds is not yet wired. Defaults (m=20, ef_construction=300) match
     // upstream Lance defaults; only the distance type is overridden.
     let builder = IvfHnswSqIndexBuilder::default().distance_type(DistanceType::Cosine);
     table
@@ -601,16 +601,15 @@ impl Index for LanceIndex {
             .map_err(Error::Backend)?;
         // Build / refresh the BM25 FTS index on `text`. Lance treats
         // `create_index` as create-or-replace, so calling per upsert keeps
-        // the index in sync without separate bookkeeping. will
-        // gate this behind a "rebuild if fragmentation > N%" check.
+        // the index in sync without separate bookkeeping. Gating this behind a
+        // "rebuild if fragmentation > N%" check is not yet wired.
         ensure_fts_index(&self.table).await?;
         Ok(())
     }
 
     async fn delete_by_path(&self, path: &str) -> Result<u64> {
-        // wires the actual incremental-reindex tombstone path. For
-        // this is enough to satisfy the trait surface and the
-        // contract test.
+        // The incremental-reindex tombstone path is not yet wired; for now
+        // this is enough to satisfy the trait surface and the contract test.
         //
         // SAFETY ASSUMPTION: `path` is a filesystem path produced by markq's
         // own indexer (canonicalized; no control bytes). The hand-rolled
@@ -680,8 +679,8 @@ impl Index for LanceIndex {
     }
 
     async fn compact(&self) -> Result<()> {
-        // wires the OptimizeAction. no-op so `markq compact`
-        // exits cleanly during smoke tests.
+        // Wiring the OptimizeAction is not yet done; for now this is a no-op so
+        // `markq compact` exits cleanly during smoke tests.
         Ok(())
     }
 }

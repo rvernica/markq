@@ -1,9 +1,9 @@
 //! `~/.markq/collections.toml` registry types.
 //!
-//! ships the serde shape only — `markq collection add/list/remove`
-//! lands in once multi-collection retrieval is wired. The registry
-//! also stores the context tree, which is why entries carry a
-//! reserved `contexts` map even though no command writes to it yet.
+//! Only the serde shape exists today — `markq collection add/list/remove`
+//! lands once multi-collection retrieval is wired. The registry also stores
+//! the context tree, which is why entries carry a reserved `contexts` map
+//! even though no command writes to it yet.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ pub struct CollectionEntry {
     pub name: String,
     /// Filesystem root indexed under this collection.
     pub root: PathBuf,
-    /// reserved: context-tree entries keyed by URI prefix.
+    /// Reserved for the context tree: entries keyed by URI prefix.
     /// `BTreeMap` for stable serialization order.
     #[serde(default)]
     pub contexts: BTreeMap<String, String>,

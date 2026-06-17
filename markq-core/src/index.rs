@@ -1,7 +1,7 @@
-//! The `Index` trait. Backend-agnostic by design — ships the LanceDB
-//! implementation; the trait shape stays backend-agnostic so a fallback can
-//! be re-added later if LanceDB's sub-1.0 API churn forces a swap, without
-//! reshaping callers.
+//! The `Index` trait. Backend-agnostic by design — the LanceDB backend is the
+//! only implementation today; the trait shape stays backend-agnostic so a
+//! fallback can be re-added later if LanceDB's sub-1.0 API churn forces a swap,
+//! without reshaping callers.
 //!
 //! Methods cover the v1 surface; v1.5 features (multi-collection filter
 //! pushdown, context-tree joins, MCP `lex`/`vec`/`hyde` sub-queries) layer on
@@ -30,8 +30,8 @@ pub struct ChunkHit {
 /// Backend-agnostic index contract.
 ///
 /// All retrieval methods take `collection: Option<&str>` so v1.5 multi-
-/// collection filtering pushes down through the same call shape — 
-/// just starts threading non-`None` values from the CLI.
+/// collection filtering pushes down through the same call shape — wiring it up
+/// just means threading non-`None` values from the CLI.
 #[async_trait]
 pub trait Index: Send + Sync {
     /// Return the dataset's Arrow schema. Used by `markq inspect` and by
@@ -46,8 +46,8 @@ pub trait Index: Send + Sync {
     /// Lance versions, optional embedder fields).
     async fn metadata(&self) -> Result<DatasetMetadata>;
 
-    /// Append/upsert a batch of chunks. wires this to incremental
-    /// reindex; just appends.
+    /// Append/upsert a batch of chunks. Incremental reindex (not yet wired)
+    /// will hook in here; for now this just appends.
     ///
     /// **Cost note**: backends are permitted to do per-call index
     /// maintenance (e.g. the LanceDB backend rebuilds the FTS index on the
@@ -58,13 +58,13 @@ pub trait Index: Send + Sync {
     /// index rebuild out of the hot path; until then, batch up-front.
     async fn upsert_chunks(&self, batches: Vec<RecordBatch>) -> Result<()>;
 
-    /// Tombstone all chunks for a source path. wires deletion;
-    /// returns Ok with a no-op when the row count is zero so the
-    /// trait surface compiles end-to-end.
+    /// Tombstone all chunks for a source path. Full deletion is not yet
+    /// wired; for now this returns Ok with a no-op when the row count is zero
+    /// so the trait surface compiles end-to-end.
     async fn delete_by_path(&self, path: &str) -> Result<u64>;
 
     /// BM25 retrieval over the `text` column. `collection` is reserved for
-    /// filter pushdown.
+    /// multi-collection filter pushdown.
     async fn bm25(&self, query: &str, k: usize, collection: Option<&str>) -> Result<Vec<ChunkHit>>;
 
     /// Vector KNN retrieval. Embedding dim must match the dataset's recorded
@@ -87,6 +87,6 @@ pub trait Index: Send + Sync {
     ) -> Result<(Vec<ChunkHit>, Vec<ChunkHit>)>;
 
     /// Reclaim space from tombstoned rows and rebuild fragmented indexes.
-    /// wires the threshold logic.
+    /// The threshold logic is not yet wired.
     async fn compact(&self) -> Result<()>;
 }

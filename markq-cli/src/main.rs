@@ -1,6 +1,6 @@
-//! `markq` CLI. wires every v1 subcommand name as a `todo!()` stub
-//! (so `markq --help` already prints the final surface) and implements
-//! `markq inspect` against the LanceDB backend.
+//! `markq` CLI. Every v1 subcommand name is wired up front (so `markq --help`
+//! already prints the final surface); unimplemented ones bail at runtime while
+//! the shipped commands run against the LanceDB backend.
 
 use std::path::PathBuf;
 
@@ -71,7 +71,7 @@ enum Command {
     /// Filesystem watch + incremental reindex (`--features watch`).
     Watch(WatchArgs),
 
-    /// Print chunks for a single markdown file (dev-only demo).
+    /// Print chunks for a single markdown file (dev-only chunker demo).
     #[command(hide = true)]
     Chunk(ChunkArgs),
 
@@ -198,8 +198,8 @@ async fn main() -> Result<()> {
         Command::Query(args) => cmd_query(&dataset_path, &args).await,
 
         // Every other v1 subcommand has its name + arg shape registered now
-        // so `markq --help` matches the final surface; bodies land in their
-        // respective milestones.
+        // so `markq --help` matches the final surface; their bodies land
+        // later.
         Command::Collection(_)
         | Command::Context(_)
         | Command::Rerank(_)

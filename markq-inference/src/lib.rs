@@ -1,7 +1,7 @@
-//! Inference layer: embedder, reranker, optional HyDE
-//! generator. Each model runs on its own owner thread fed by a
+//! Inference layer: embedder today, with a reranker and optional HyDE
+//! generator to follow. Each model runs on its own owner thread fed by a
 //! bounded crossbeam channel; `LlamaContext` is `!Send` so this is the only
-//! correct shape (see plan.md § "Inference architecture").
+//! correct shape.
 
 pub mod backend;
 pub mod embedder;

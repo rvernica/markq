@@ -1,4 +1,4 @@
-//! Arrow schema for the chunk table — designed once in to its final
+//! Arrow schema for the chunk table — designed up front to its final
 //! v1.5 shape so adding `markq context add` and multi-collection
 //! routing is additive rather than a Lance migration + full
 //! re-embed.
@@ -67,8 +67,9 @@ pub fn chunk_arrow_schema(embedding_dim: i32) -> SchemaRef {
         // rows written before `markq embed` (which fills it in alongside the
         // embedding).
         Field::new(ChunkColumn::TOKENS, DataType::Int32, true),
-        // Vector embedding. Nullable until . Fixed-size list keeps
-        // LanceDB's HNSW happy (it requires fixed-width vectors).
+        // Vector embedding. Nullable until `markq embed` fills it in.
+        // Fixed-size list keeps LanceDB's HNSW happy (it requires
+        // fixed-width vectors).
         Field::new(
             ChunkColumn::EMBEDDING,
             DataType::FixedSizeList(
@@ -77,7 +78,7 @@ pub fn chunk_arrow_schema(embedding_dim: i32) -> SchemaRef {
             ),
             true,
         ),
-        // Reserved for context tree. Nullable until then; populated
+        // Reserved for the context tree. Nullable until then; populated
         // at retrieval time once context entries are added.
         Field::new(ChunkColumn::CONTEXT_ID, DataType::Utf8, true),
         // Per-row schema version mirror of the dataset metadata. Lets queries

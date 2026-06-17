@@ -2,7 +2,7 @@
 //! record; `hf-hub` writes into `~/.cache/markq/models/<repo>/<file>` (or
 //! `$MARKQ_MODELS_DIR` when set). After a download we optionally verify a
 //! known SHA-256 against the file; this is best-effort in v1 — the full
-//! resumable / `markq models pull` UX lands in .
+//! resumable / `markq models pull` UX lands later.
 
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -13,9 +13,9 @@ use hf_hub::HFClient;
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
-/// Curated set of GGUFs markq knows how to fetch. Each milestone that needs a new
-/// model adds an entry. v1 only ships the embedder; the reranker
-/// and HyDE generator will join this list.
+/// Curated set of GGUFs markq knows how to fetch. Each new model that's
+/// needed adds an entry. v1 only ships the embedder; a reranker and HyDE
+/// generator will join this list later.
 #[derive(Debug, Clone, Copy)]
 pub enum KnownModel {
     /// Qwen3-Embedding-0.6B, Q8_0 quantization (the smallest GGUF the upstream
@@ -49,7 +49,7 @@ impl KnownModel {
 
     /// Known-good SHA-256 hex digest, when one has been recorded. `None` means
     /// "no pin yet"; the cache then logs a warning rather than failing the
-    /// download. the `markq doctor` will surface unpinned models.
+    /// download. A future `markq doctor` will surface unpinned models.
     pub fn sha256(self) -> Option<&'static str> {
         match self {
             // TODO: record the digest of the Qwen3-Embedding GGUF

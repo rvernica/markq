@@ -1,7 +1,7 @@
 //! Embedder: owner thread holding `LlamaModel + LlamaContext`, fed by a
 //! bounded crossbeam channel. `LlamaContext` is `!Send`, so the only correct
-//! shape is single-owner thread + message passing. Future reranker
-//! and HyDE generator copy this exact shape.
+//! shape is single-owner thread + message passing. A future reranker and
+//! HyDE generator copy this exact shape.
 //!
 //! Batching: this first cut decodes one text per `llama_decode`. The plan
 //! aspires to 32–64 chunks per decode for throughput; the channel + owner-
@@ -206,7 +206,6 @@ mod tests {
     // Real-model tests live in markq-cli's e2e suite (gated on
     // MARKQ_TEST_MODEL). Pure unit tests here would need to mock
     // LlamaContext, which is `!Send` and has no trait abstraction — not
-    // worth the scaffolding for a single milestone. See plan.md verification
-    // section: channel back-pressure / dim-mismatch coverage lives in
-    // markq-index-lance and the embed e2e.
+    // worth the scaffolding for a single embed path. Channel back-pressure /
+    // dim-mismatch coverage lives in markq-index-lance and the embed e2e.
 }

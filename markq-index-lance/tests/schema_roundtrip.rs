@@ -1,5 +1,5 @@
-//! schema round-trip: build a chunk RecordBatch, upsert, reopen,
-//! assert the dataset reports the same field shape and the row is there.
+//! Schema round-trip: build a chunk RecordBatch, upsert, reopen, assert the
+//! dataset reports the same field shape and the row is there.
 
 use std::sync::Arc;
 

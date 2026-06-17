@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Bumped when the chunk Arrow schema changes shape. ships v1.
+/// Bumped when the chunk Arrow schema changes shape. v1 is the current shape.
 pub const SCHEMA_VERSION: u32 = 1;
 
 pub const KEY_SCHEMA_VERSION: &str = "markq.schema_version";
@@ -23,10 +23,10 @@ pub const KEY_LANCE_FILE_FORMAT_VERSION: &str = "markq.lance_file_format_version
 /// build time via `env!("CARGO_PKG_VERSION")` against our pinned dep.
 pub const KEY_LANCEDB_CRATE_VERSION: &str = "markq.lancedb_crate_version";
 
-/// Reserved for — embedder model id (e.g. `Qwen3-Embedding-0.6B`).
+/// Embedder model id (e.g. `Qwen3-Embedding-0.6B`).
 pub const KEY_EMBEDDER_MODEL: &str = "markq.embedder_model";
 
-/// Reserved for — embedder output dimension as a decimal string.
+/// Embedder output dimension as a decimal string.
 pub const KEY_EMBEDDER_DIM: &str = "markq.embedder_dim";
 
 /// Typed view of the metadata read back from a dataset. Optional fields are

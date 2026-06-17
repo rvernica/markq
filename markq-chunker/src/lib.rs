@@ -1,4 +1,4 @@
-//! markdown chunker.
+//! Markdown chunker.
 //!
 //! Splits a markdown source into roughly fixed-token chunks while respecting
 //! structural boundaries: headings are preferred split points, fenced code
@@ -7,8 +7,8 @@
 //! context across a hard boundary.
 //!
 //! The chunker is pure-CPU and inference-free; tokens are counted via the
-//! pluggable [`Tokenize`] trait so can swap the approximator for the
-//! real Qwen embedder tokenizer without touching this crate.
+//! pluggable [`Tokenize`] trait so the approximator can later be swapped for
+//! the real Qwen embedder tokenizer without touching this crate.
 
 pub mod blocks;
 pub mod frontmatter;

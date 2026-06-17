@@ -330,8 +330,7 @@ The embedder thread holds the model in RAM only for the lifetime of the
 `markq embed` invocation. Re-runs reload the weights, but llama.cpp
 memory-maps the GGUF and the file's pages stay in the OS page cache,
 so the second cold-start is sub-second. A long-running daemon mode
-(weights stay warm across queries) lands with `markq serve` in
-.
+(weights stay warm across queries) lands with `markq serve`.
 
 GPU offload is opt-in via Cargo features:
 
@@ -340,9 +339,9 @@ cargo build --release --features vulkan   # or cuda
 ```
 
 Without those features the binary stays CPU-only and ignores GPU
-detection. The build supports the inference-thread + bounded-
-channel pattern that (reranker) and (HyDE generator)
-will copy verbatim.
+detection. The current build supports the inference-thread + bounded-
+channel pattern that a future reranker and HyDE generator will copy
+verbatim.
 
 ## `markq vsearch`
 

@@ -1,9 +1,8 @@
 //! Edge-case tests for the chunker.
 //!
 //! These run against synthetic fixtures embedded in the test source rather
-//! than disk fixtures. The `corpus/` directory will be wired in as
-//! a separate evaluation harness during (per
-//! `spikes/PHASE1_FOLLOWUPS.md`).
+//! than disk fixtures. The `corpus/` directory will be wired in as a separate
+//! evaluation harness later (per `spikes/PHASE1_FOLLOWUPS.md`).
 
 use markq_chunker::{chunk_markdown, ApproxTokenizer, ChunkOptions};
 

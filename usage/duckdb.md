@@ -7,8 +7,8 @@ Lance dataset rather than an opaque internal index.
 
 All output below is from real runs against the default dataset after
 indexing this repo's `README.md` (8 chunks). Some examples additionally
-require `markq embed` to have run on the dataset (onward —
-`embedding` column populated, HNSW index built). Reproduce with:
+require `markq embed` to have run on the dataset (`embedding` column
+populated, HNSW index built). Reproduce with:
 
 ```sh
 markq index README.md
@@ -256,7 +256,7 @@ care of that for you via `markq vsearch`.
 
 **Hybrid** (`lance_hybrid_search`, `alpha` weighting BM25 vs vector)
 will see real signal once both indexes are populated together. The
-markq-side hybrid `markq query` ships in with RRF fusion.
+markq-side hybrid is `markq query`, which fuses BM25 and vector with RRF.
 
 ## Lance auto-cleanup config
 

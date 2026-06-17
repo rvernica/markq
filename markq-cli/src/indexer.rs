@@ -1,8 +1,8 @@
-//! indexer: walk a path, chunk markdown, write rows to the index.
+//! Indexer: walk a path, chunk markdown, write rows to the index.
 //!
-//! No embeddings yet — `embedding` is left null. fills it in via
-//! `markq embed`. makes this incremental (skip unchanged files,
-//! tombstone removed ones); for now every run is a full append.
+//! No embeddings yet — `embedding` is left null; `markq embed` fills it in
+//! later. Indexing is not yet incremental (skip unchanged files, tombstone
+//! removed ones); for now every run is a full append.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -18,8 +18,9 @@ use walkdir::WalkDir;
 
 const DEFAULT_COLLECTION: &str = "default";
 
-/// Outcome of an `markq index <path>` invocation. reports the totals
-/// straight; will extend this with `skipped` / `tombstoned` counts.
+/// Outcome of an `markq index <path>` invocation. For now this reports the
+/// totals straight; incremental indexing will extend it with `skipped` /
+/// `tombstoned` counts.
 pub struct IndexReport {
     pub files: usize,
     pub chunks: usize,
@@ -117,8 +118,8 @@ fn build_file_rows(path: &Path, root: &Path) -> Result<FileRows> {
             // Identity = (uri, content_hash, chunk_index). Two distinct files
             // with identical content (duplicated READMEs in a monorepo,
             // vendored notes, generated docs) must not collide on id; once
-            // turns upsert into a real merge-on-id, a collision
-            // would let one file overwrite another's chunk text.
+            // upsert becomes a real merge-on-id, a collision would let one
+            // file overwrite another's chunk text.
             let mut h = blake3::Hasher::new();
             h.update(uri.as_bytes());
             h.update(&[0u8]); // separator so prefix collisions are impossible
