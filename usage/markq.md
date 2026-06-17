@@ -64,25 +64,26 @@ Local-first markdown retrieval (BM25 + vector + RRF + rerank)
 Usage: markq [OPTIONS] <COMMAND>
 
 Commands:
-  index       Index a path into the default collection
-  embed       Generate embeddings for unembedded rows
-  collection  Manage collections
-  context     Manage the context tree
-  search      BM25 retrieval
-  vsearch     Vector retrieval
-  query       Hybrid retrieval (BM25 + vector + RRF)
-  rerank      Hybrid retrieval + cross-encoder rerank
-  get         Fetch one document by path or `#docid`
-  multi-get   Fetch many documents by glob/csv/`#ids`
-  compact     Reclaim space from tombstoned chunks
-  doctor      Diagnose index, model, and dimension issues
-  models      Manage the GGUF model cache
-  watch       Filesystem watch + incremental reindex (`--features watch`)
-  serve       Run the MCP server over stdio
-  inspect     Print the dataset path, Arrow schema, row count, and recorded metadata
-  status      Show index health, collection sizes, model state
-  config      Show or edit the markq config
-  help        Print this message or the help of the given subcommand(s)
+  index        Index a path into the default collection
+  embed        Generate embeddings for unembedded rows
+  embed-query  Embed one query string and print the vector as JSON
+  collection   Manage collections
+  context      Manage the context tree
+  search       BM25 retrieval
+  vsearch      Vector retrieval
+  query        Hybrid retrieval (BM25 + vector + RRF)
+  rerank       Hybrid retrieval + cross-encoder rerank
+  get          Fetch one document by path or `#docid`
+  multi-get    Fetch many documents by glob/csv/`#ids`
+  compact      Reclaim space from tombstoned chunks
+  doctor       Diagnose index, model, and dimension issues
+  models       Manage the GGUF model cache
+  watch        Filesystem watch + incremental reindex (`--features watch`)
+  serve        Run the MCP server over stdio
+  inspect      Print the dataset path, Arrow schema, row count, and recorded metadata
+  status       Show index health, collection sizes, model state
+  config       Show or edit the markq config
+  help         Print this message or the help of the given subcommand(s)
 ```
 
 Per-subcommand help works even on stubs — useful for previewing the final
@@ -118,6 +119,7 @@ Error: not implemented yet
 | `embed` | ✅ Implemented (Qwen3-Embedding-0.6B Q8_0, HNSW index build) |
 | `vsearch <query>` | ✅ Implemented (cosine KNN over the HNSW vector index) |
 | `query <query>` | ✅ Implemented (BM25 + vector + weighted RRF; `--explain` available) |
+| `embed-query <query>` | ✅ Implemented (prints the query embedding as JSON for external vector search) |
 | `rerank` | Stub (`not implemented yet`) |
 | `get`, `multi-get`, `compact`, `doctor` | Stub |
 | `status`, `config` | Stub |
@@ -497,6 +499,31 @@ A query against a dataset without embeddings fails the same way
 ```
 Error: no embeddings in this dataset; run `markq embed` first to populate them
 ```
+
+## `markq embed-query`
+
+Embeds a single query string with the canonical embedder and prints the
+vector as a one-line JSON array on stdout — nothing else. This lets
+external tools run their own vector search against the markq dataset
+without loading a GGUF themselves: splice the array into DuckDB's
+`lance_vector_search`, feed it to pylance, or pipe it through `jq`.
+
+```sh
+markq embed-query "how does retrieval work"
+```
+
+```
+[0.0123,-0.0456,0.0789, ... ]
+```
+
+It uses the exact same `Embedder::load` + `embedder.embed` path as
+`vsearch` and `query`, so the vector is cosine-compatible with the
+dataset's stored embeddings by construction. Before loading the model it
+validates the dataset's recorded `markq.embedder_model` — if the dataset
+was built with a different embedder, or has no embeddings yet, it fails
+loudly with the same message as `vsearch` rather than printing a vector
+that would silently mismatch. See [`usage/duckdb.md`](duckdb.md) for the
+end-to-end SQL composition.
 
 ## Use a throwaway dataset
 
