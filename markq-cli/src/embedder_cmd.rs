@@ -2,9 +2,10 @@
 //!
 //! Loops over batches of `embedding IS NULL` rows, embeds each text via the
 //! markq-inference `Embedder` (one owner thread + bounded crossbeam channel),
-//! and merge-inserts the embedded batch back keyed on `id`. The LanceDB
-//! vector index is rebuilt once after the loop drains, not per batch; the
-//! BM25 path is untouched.
+//! and merge-inserts the embedded batch back keyed on `id`. After the loop
+//! drains, both the vector index and the BM25 FTS index are rebuilt once (not
+//! per batch): the `merge_insert` rewrites every row into fresh fragments, so
+//! the FTS index built at index time must be rebuilt or keyword search breaks.
 //!
 //! Ctrl-C drains cleanly: a signal flips a flag that's checked between
 //! batches. An in-flight batch always finishes — never abort mid-decode.
@@ -91,12 +92,17 @@ pub async fn run_embed(idx: &LanceIndex) -> Result<EmbedReport> {
     // normally so re-running embed in the same process gets a fresh handler.
     signal_task.abort();
 
-    // Build the HNSW vector index once, after every merge has landed. Doing
-    // it per batch would trigger a full rebuild on every 256-row chunk.
+    // Rebuild both indexes once, after every merge has landed. Doing it per
+    // batch would trigger a full rebuild on every 256-row chunk. The FTS
+    // rebuild is mandatory, not just an optimization: `apply_embeddings` uses
+    // `merge_insert`, which rewrites every row into fresh fragments, so the
+    // FTS index built at index time would otherwise be left covering dead
+    // rows and BM25 retrieval would collapse.
     if total_rows > 0 {
         idx.rebuild_vector_index()
             .await
             .context("rebuild vector index")?;
+        idx.rebuild_fts_index().await.context("rebuild FTS index")?;
     }
 
     Ok(EmbedReport {

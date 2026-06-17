@@ -276,6 +276,16 @@ impl LanceIndex {
     pub async fn rebuild_vector_index(&self) -> Result<()> {
         ensure_vector_index(&self.table).await
     }
+
+    /// (Re)build the BM25 FTS index on the `text` column. Idempotent. This must
+    /// be called after a bulk embedding pass: `apply_embeddings` uses
+    /// `merge_insert`, which rewrites every matched row into new fragments and
+    /// tombstones the originals, leaving the FTS index built at index time
+    /// covering only dead rows. Without this rebuild, BM25 (and the BM25 half
+    /// of hybrid retrieval) silently collapses after the first embed.
+    pub async fn rebuild_fts_index(&self) -> Result<()> {
+        ensure_fts_index(&self.table).await
+    }
 }
 
 /// Read the `embedding` column's `FixedSizeList` element count from the
