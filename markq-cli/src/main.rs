@@ -12,10 +12,20 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use markq_cli::{embed_query, embedder_cmd, indexer, query, search, vsearch};
 
+/// Version string with the compiled-in inference backend appended, so
+/// `markq --version` reveals whether GPU offload is available without
+/// having to `ldd` the binary or load a model.
+#[cfg(feature = "vulkan")]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (backend: vulkan)");
+#[cfg(all(feature = "cuda", not(feature = "vulkan")))]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (backend: cuda)");
+#[cfg(not(any(feature = "vulkan", feature = "cuda")))]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (backend: cpu)");
+
 #[derive(Parser, Debug)]
 #[command(
     name = "markq",
-    version,
+    version = VERSION,
     about = "Local-first markdown retrieval (BM25 + vector + RRF + rerank)"
 )]
 struct Cli {
