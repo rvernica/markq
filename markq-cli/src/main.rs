@@ -227,9 +227,11 @@ async fn cmd_index(dataset_path: &std::path::Path, args: &IndexArgs) -> Result<(
         .context("open or create dataset")?;
     let report = indexer::run_index(&idx, &root).await?;
     println!(
-        "indexed {} file(s), {} chunk(s) into {}",
+        "indexed {} file(s), {} chunk(s) ({} skipped, {} removed) into {}",
         report.files,
         report.chunks,
+        report.skipped,
+        report.removed,
         idx.path().display()
     );
     Ok(())

@@ -7,6 +7,8 @@
 //! pushdown, context-tree joins, MCP `lex`/`vec`/`hyde` sub-queries) layer on
 //! top of these primitives without changing the trait shape.
 
+use std::collections::HashMap;
+
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -58,10 +60,18 @@ pub trait Index: Send + Sync {
     /// index rebuild out of the hot path; until then, batch up-front.
     async fn upsert_chunks(&self, batches: Vec<RecordBatch>) -> Result<()>;
 
-    /// Tombstone all chunks for a source path. Full deletion is not yet
-    /// wired; for now this returns Ok with a no-op when the row count is zero
-    /// so the trait surface compiles end-to-end.
-    async fn delete_by_path(&self, path: &str) -> Result<u64>;
+    /// Tombstone all chunks for a source `path` within `collection`. Scoped by
+    /// collection so the same file path indexed into two collections is deleted
+    /// independently.
+    async fn delete_by_path(&self, collection: &str, path: &str) -> Result<u64>;
+
+    /// Map each indexed source `path` to its stored `content_hash`, restricted
+    /// to `collection`. All chunks of a file share both, so the result has one
+    /// entry per source file. The indexer uses this to skip files whose content
+    /// is unchanged, replace files whose hash changed, and prune files that no
+    /// longer exist. Scoped by collection: the same path in another collection
+    /// is invisible here, so per-collection diffs stay independent.
+    async fn existing_file_hashes(&self, collection: &str) -> Result<HashMap<String, String>>;
 
     /// BM25 retrieval over the `text` column. `collection` is reserved for
     /// multi-collection filter pushdown.

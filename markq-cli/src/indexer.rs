@@ -1,9 +1,12 @@
 //! Indexer: walk a path, chunk markdown, write rows to the index.
 //!
-//! No embeddings yet — `embedding` is left null; `markq embed` fills it in
-//! later. Indexing is not yet incremental (skip unchanged files, tombstone
-//! removed ones); for now every run is a full append.
+//! No embeddings here — `embedding` is left null; `markq embed` fills it in
+//! later. Indexing is incremental and keyed on each file's `content_hash`:
+//! unchanged files are skipped (keeping their existing rows and embeddings),
+//! edited files have their old chunks deleted before the new ones are added,
+//! new files are added, and files that have vanished from disk are pruned.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,12 +21,16 @@ use walkdir::WalkDir;
 
 const DEFAULT_COLLECTION: &str = "default";
 
-/// Outcome of an `markq index <path>` invocation. For now this reports the
-/// totals straight; incremental indexing will extend it with `skipped` /
-/// `tombstoned` counts.
+/// Outcome of a `markq index <path>` invocation.
 pub struct IndexReport {
+    /// Files (re)indexed this run — new files plus changed files.
     pub files: usize,
+    /// Chunks written this run (from the `files` above).
     pub chunks: usize,
+    /// Files skipped because their content was unchanged since the last index.
+    pub skipped: usize,
+    /// Previously-indexed files pruned because they no longer exist on disk.
+    pub removed: usize,
 }
 
 pub async fn run_index<I: Index>(idx: &I, root: &Path) -> Result<IndexReport> {
@@ -32,9 +39,20 @@ pub async fn run_index<I: Index>(idx: &I, root: &Path) -> Result<IndexReport> {
         .with_context(|| format!("canonicalize {}", root.display()))?;
 
     let schema = idx.arrow_schema();
+    // Snapshot what's already indexed so we can skip files whose content is
+    // unchanged rather than re-appending duplicate rows.
+    let existing = idx
+        .existing_file_hashes(DEFAULT_COLLECTION)
+        .await
+        .context("read existing file hashes")?;
+
     let mut total_files = 0usize;
     let mut total_chunks = 0usize;
+    let mut skipped = 0usize;
     let mut row_files: Vec<FileRows> = Vec::new();
+    // Track every path still present on disk so we can prune the rows of files
+    // that have since been deleted.
+    let mut seen: HashSet<String> = HashSet::new();
 
     let entries: Vec<_> = WalkDir::new(&root)
         .follow_links(false)
@@ -52,33 +70,74 @@ pub async fn run_index<I: Index>(idx: &I, root: &Path) -> Result<IndexReport> {
 
     for entry in entries {
         let path = entry.path();
-        match build_file_rows(path, &root) {
-            Ok(rows) => {
-                total_files += 1;
-                total_chunks += rows.chunks.len();
-                row_files.push(rows);
+        let raw = match read_raw_file(path, &root) {
+            Ok(raw) => raw,
+            Err(e) => {
+                warn!(file = %path.display(), error = %e, "skipping file");
+                continue;
             }
-            Err(e) => warn!(file = %path.display(), error = %e, "skipping file"),
+        };
+        seen.insert(raw.path_str.clone());
+        match existing.get(&raw.path_str) {
+            // Unchanged file: identical bytes already indexed → skip, keeping
+            // its existing rows (and embeddings) untouched.
+            Some(hash) if *hash == raw.content_hash => {
+                skipped += 1;
+                continue;
+            }
+            // Edited file: drop its old chunks before adding the new ones so
+            // the old text (and any chunks the shorter version no longer has)
+            // don't linger as orphans.
+            Some(_) => {
+                idx.delete_by_path(DEFAULT_COLLECTION, &raw.path_str)
+                    .await
+                    .with_context(|| format!("delete prior chunks for {}", raw.path_str))?;
+            }
+            // New file: nothing to delete.
+            None => {}
         }
-    }
-
-    if row_files.is_empty() {
-        info!(path = %root.display(), "no markdown files found");
-        return Ok(IndexReport {
-            files: 0,
-            chunks: 0,
+        let chunks = chunk_raw(&raw);
+        total_files += 1;
+        total_chunks += chunks.len();
+        row_files.push(FileRows {
+            path_str: raw.path_str,
+            uri: raw.uri,
+            content_hash: raw.content_hash,
+            mtime_nanos: raw.mtime_nanos,
+            chunks,
         });
     }
 
-    let batch = build_record_batch(&schema, &row_files)?;
-    debug!(rows = batch.num_rows(), "upserting batch");
-    idx.upsert_chunks(vec![batch])
-        .await
-        .context("upsert chunks into index")?;
+    // Prune rows for files that were indexed previously but are gone from disk.
+    // Scope the prune to the indexed root: a previously-indexed file outside
+    // `root` (e.g. from indexing a sibling directory) is out of this run's
+    // scope and must be left alone — only files under `root` that have
+    // vanished get pruned.
+    let mut removed = 0usize;
+    for path in existing.keys() {
+        if Path::new(path).starts_with(&root) && !seen.contains(path) {
+            idx.delete_by_path(DEFAULT_COLLECTION, path)
+                .await
+                .with_context(|| format!("prune removed file {path}"))?;
+            removed += 1;
+        }
+    }
+
+    if !row_files.is_empty() {
+        let batch = build_record_batch(&schema, &row_files)?;
+        debug!(rows = batch.num_rows(), "upserting batch");
+        idx.upsert_chunks(vec![batch])
+            .await
+            .context("upsert chunks into index")?;
+    } else {
+        info!(path = %root.display(), "nothing to index (no new or changed files)");
+    }
 
     Ok(IndexReport {
         files: total_files,
         chunks: total_chunks,
+        skipped,
+        removed,
     })
 }
 
@@ -97,7 +156,18 @@ struct ChunkRow {
     token_count: i32,
 }
 
-fn build_file_rows(path: &Path, root: &Path) -> Result<FileRows> {
+/// A file's bytes read once, with identity (uri / path / content hash / mtime)
+/// computed but not yet chunked. Splitting the read from the chunk lets the
+/// indexer decide skip/replace/add from `content_hash` before paying to chunk.
+struct RawFile {
+    uri: String,
+    path_str: String,
+    content_hash: String,
+    mtime_nanos: i64,
+    text: String,
+}
+
+fn read_raw_file(path: &Path, root: &Path) -> Result<RawFile> {
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let text = String::from_utf8_lossy(&bytes).into_owned();
 
@@ -109,21 +179,31 @@ fn build_file_rows(path: &Path, root: &Path) -> Result<FileRows> {
     let uri = format!("markq://{DEFAULT_COLLECTION}/{rel_str}");
     let path_str = path.to_string_lossy().into_owned();
 
-    let opts = ChunkOptions::default();
-    let chunks = chunk_markdown(&text, &opts, &ApproxTokenizer);
+    Ok(RawFile {
+        uri,
+        path_str,
+        content_hash,
+        mtime_nanos,
+        text,
+    })
+}
 
-    let chunk_rows = chunks
+fn chunk_raw(raw: &RawFile) -> Vec<ChunkRow> {
+    let opts = ChunkOptions::default();
+    let chunks = chunk_markdown(&raw.text, &opts, &ApproxTokenizer);
+
+    chunks
         .into_iter()
         .map(|c| {
             // Identity = (uri, content_hash, chunk_index). Two distinct files
             // with identical content (duplicated READMEs in a monorepo,
-            // vendored notes, generated docs) must not collide on id; once
-            // upsert becomes a real merge-on-id, a collision would let one
-            // file overwrite another's chunk text.
+            // vendored notes, generated docs) must not collide on id; the
+            // merge-on-id upsert path relies on this to avoid one file
+            // overwriting another's chunk text.
             let mut h = blake3::Hasher::new();
-            h.update(uri.as_bytes());
+            h.update(raw.uri.as_bytes());
             h.update(&[0u8]); // separator so prefix collisions are impossible
-            h.update(content_hash.as_bytes());
+            h.update(raw.content_hash.as_bytes());
             h.update(&(c.index as u32).to_le_bytes());
             ChunkRow {
                 id: h.finalize().to_hex().to_string(),
@@ -132,15 +212,7 @@ fn build_file_rows(path: &Path, root: &Path) -> Result<FileRows> {
                 token_count: c.token_count.min(i32::MAX as usize) as i32,
             }
         })
-        .collect();
-
-    Ok(FileRows {
-        path_str,
-        uri,
-        content_hash,
-        mtime_nanos,
-        chunks: chunk_rows,
-    })
+        .collect()
 }
 
 /// True for entries that should be pruned from the walk. Always permit the

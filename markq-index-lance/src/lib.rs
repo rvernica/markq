@@ -617,19 +617,26 @@ impl Index for LanceIndex {
         Ok(())
     }
 
-    async fn delete_by_path(&self, path: &str) -> Result<u64> {
-        // The incremental-reindex tombstone path is not yet wired; for now
-        // this is enough to satisfy the trait surface and the contract test.
+    async fn delete_by_path(&self, collection: &str, path: &str) -> Result<u64> {
+        // Used by incremental reindex to drop a file's chunks before its
+        // replacement rows are added (edited files) and to prune files removed
+        // from disk. Scoped to `collection` so the same path in another
+        // collection is left untouched.
         //
-        // SAFETY ASSUMPTION: `path` is a filesystem path produced by markq's
+        // SAFETY ASSUMPTION: `collection` and `path` are produced by markq's
         // own indexer (canonicalized; no control bytes). The hand-rolled
         // single-quote doubling matches Lance/DataFusion's expression-parser
         // escape rules, but it is not a general SQL sanitizer. If a future
         // caller ever threads user-controlled strings through this method
         // (e.g. a `markq delete <pattern>` command), swap to a parameter-
         // bound delete API rather than extending this escape.
-        let escaped = path.replace('\'', "''");
-        let predicate = format!("path = '{escaped}'");
+        let predicate = format!(
+            "{} = '{}' AND {} = '{}'",
+            ChunkColumn::COLLECTION,
+            collection.replace('\'', "''"),
+            ChunkColumn::PATH,
+            path.replace('\'', "''"),
+        );
         let res = self
             .table
             .delete(&predicate)
@@ -637,6 +644,40 @@ impl Index for LanceIndex {
             .context("delete by path")
             .map_err(Error::Backend)?;
         Ok(res.num_deleted_rows)
+    }
+
+    async fn existing_file_hashes(&self, collection: &str) -> Result<HashMap<String, String>> {
+        let predicate = format!(
+            "{} = '{}'",
+            ChunkColumn::COLLECTION,
+            collection.replace('\'', "''"),
+        );
+        let mut stream = self
+            .table
+            .query()
+            .only_if(predicate)
+            .select(Select::Columns(vec![
+                ChunkColumn::PATH.to_string(),
+                ChunkColumn::CONTENT_HASH.to_string(),
+            ]))
+            .execute()
+            .await
+            .context("execute file-hash scan")
+            .map_err(Error::Backend)?;
+        let mut out = HashMap::new();
+        while let Some(batch) = stream
+            .try_next()
+            .await
+            .context("read file-hash batch")
+            .map_err(Error::Backend)?
+        {
+            let paths = column_string(&batch, ChunkColumn::PATH)?;
+            let hashes = column_string(&batch, ChunkColumn::CONTENT_HASH)?;
+            for i in 0..batch.num_rows() {
+                out.insert(paths.value(i).to_string(), hashes.value(i).to_string());
+            }
+        }
+        Ok(out)
     }
 
     async fn bm25(
@@ -942,6 +983,71 @@ mod tests {
             .collect();
         remaining_ids.sort();
         assert_eq!(remaining_ids, vec!["b".to_string(), "d".to_string()]);
+    }
+
+    /// Build a 2-row batch where the *same* file path appears in two different
+    /// collections, so we can assert the diff/delete are scoped per collection.
+    fn two_collection_batch(schema: &SchemaRef) -> RecordBatch {
+        let embedding_dtype = schema
+            .field_with_name(ChunkColumn::EMBEDDING)
+            .unwrap()
+            .data_type();
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec!["id-default", "id-other"])),
+            Arc::new(StringArray::from(vec!["default", "other"])),
+            Arc::new(StringArray::from(vec![
+                "markq://default/shared.md",
+                "markq://other/shared.md",
+            ])),
+            Arc::new(StringArray::from(vec!["/shared.md", "/shared.md"])),
+            Arc::new(StringArray::from(vec!["hash-default", "hash-other"])),
+            Arc::new(Int64Array::from(vec![0i64, 0])),
+            Arc::new(Int32Array::from(vec![0i32, 0])),
+            Arc::new(StringArray::from(vec!["text default", "text other"])),
+            Arc::new(Int32Array::from(vec![Some(1i32), Some(1)])),
+            new_null_array(embedding_dtype, 2),
+            Arc::new(StringArray::from(vec![None as Option<&str>, None])),
+            Arc::new(Int32Array::from(vec![SCHEMA_VERSION as i32; 2])),
+        ];
+        RecordBatch::try_new(schema.clone(), cols).unwrap()
+    }
+
+    #[tokio::test]
+    async fn existing_file_hashes_and_delete_are_collection_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chunks.lance");
+        let idx = LanceIndex::open_or_create_with_dim(&path, 4).await.unwrap();
+        idx.upsert_chunks(vec![two_collection_batch(&idx.arrow_schema())])
+            .await
+            .unwrap();
+
+        // existing_file_hashes only returns the requested collection's files,
+        // even though the path is identical across collections.
+        let default = idx.existing_file_hashes("default").await.unwrap();
+        assert_eq!(
+            default.get("/shared.md").map(String::as_str),
+            Some("hash-default")
+        );
+        assert_eq!(default.len(), 1);
+        let other = idx.existing_file_hashes("other").await.unwrap();
+        assert_eq!(
+            other.get("/shared.md").map(String::as_str),
+            Some("hash-other")
+        );
+        assert_eq!(other.len(), 1);
+
+        // Deleting a path in one collection must not touch the other.
+        let n = idx.delete_by_path("default", "/shared.md").await.unwrap();
+        assert_eq!(
+            n, 1,
+            "delete should remove exactly the default-collection row"
+        );
+        assert!(idx
+            .existing_file_hashes("default")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(idx.existing_file_hashes("other").await.unwrap().len(), 1);
     }
 
     #[tokio::test]

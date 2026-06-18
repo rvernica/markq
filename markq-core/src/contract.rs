@@ -64,10 +64,17 @@ pub async fn run_contract<I: Index>(idx: &I) {
 
     // Delete on a path with no matching rows is a 0-row no-op.
     let removed = idx
-        .delete_by_path("does/not/exist.md")
+        .delete_by_path("default", "does/not/exist.md")
         .await
         .expect("delete_by_path");
     assert_eq!(removed, 0);
+
+    // existing_file_hashes on an empty backend returns nothing.
+    assert!(idx
+        .existing_file_hashes("default")
+        .await
+        .expect("existing_file_hashes")
+        .is_empty());
 
     // Compact on an empty index is a no-op.
     idx.compact().await.expect("compact");
