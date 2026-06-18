@@ -647,6 +647,11 @@ impl Index for LanceIndex {
     }
 
     async fn existing_file_hashes(&self, collection: &str) -> Result<HashMap<String, String>> {
+        // Scans one row per chunk and collapses to one entry per file via the
+        // map (all chunks of a file share path + content_hash), so the work is
+        // O(total chunks) rather than O(files). Fine at current scale; a
+        // DISTINCT / group-by pushdown could trim it for very large corpora if
+        // this ever shows up in an index profile.
         let predicate = format!(
             "{} = '{}'",
             ChunkColumn::COLLECTION,

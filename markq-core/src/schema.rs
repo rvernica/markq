@@ -47,11 +47,15 @@ pub fn chunk_arrow_schema(embedding_dim: i32) -> SchemaRef {
         // Routing column for `-c <name>` filter pushdown.
         // Always populated; defaults to "default" before multi-collection lands.
         Field::new(ChunkColumn::COLLECTION, DataType::Utf8, false),
-        // Canonical URI of the source document (`markq://<collection>/<path>`).
-        // Reserved here so context-tree prefix matching is a
-        // pure-additive change rather than a schema migration.
+        // URI of the source document (`markq://<collection>/<path>`), where
+        // `<path>` is relative to the indexed root. Reserved here so
+        // context-tree prefix matching is a pure-additive change rather than a
+        // schema migration.
         Field::new(ChunkColumn::URI, DataType::Utf8, false),
-        // Filesystem path relative to the collection root.
+        // Absolute, canonicalized filesystem path of the source file. Stable
+        // across index invocations (unlike `uri`, which is root-relative), so
+        // it is the identity the incremental-reindex diff/delete key on,
+        // paired with `collection`.
         Field::new(ChunkColumn::PATH, DataType::Utf8, false),
         // Blake3 / sha256 hex digest of the source file. Drives incremental
         // reindex: unchanged hash → skip the file entirely.

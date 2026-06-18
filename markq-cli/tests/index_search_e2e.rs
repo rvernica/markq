@@ -228,6 +228,71 @@ async fn reindex_subdir_does_not_prune_files_outside_it() {
 }
 
 #[tokio::test]
+async fn reindex_cleans_up_orphans_when_file_shrinks() {
+    let (idx, _tmp) = fresh_index().await;
+    // Three heading sections, each with enough text to be its own chunk.
+    let filler = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod ";
+    let big = format!(
+        "# Doc\n\n## One\n\nalphaterm {f}\n\n## Two\n\nbetaterm {f}\n\n## Three\n\ngammaterm {f}\n",
+        f = filler.repeat(8)
+    );
+    let corpus = corpus_with(&[("doc.md", big.as_str())]);
+    run_index(&idx, corpus.path()).await.unwrap();
+    let rows_big = idx.count_rows().await.unwrap();
+    assert!(
+        rows_big >= 3,
+        "multi-section file should produce multiple chunks, got {rows_big}"
+    );
+
+    // Shrink the file to a single section.
+    std::fs::write(
+        corpus.path().join("doc.md"),
+        format!("# Doc\n\n## One\n\nalphaterm {}\n", filler.repeat(8)),
+    )
+    .unwrap();
+    run_index(&idx, corpus.path()).await.unwrap();
+
+    // The dropped sections' unique terms must be gone (no orphaned chunks),
+    // the surviving section stays searchable, and the row count shrinks.
+    assert!(
+        idx.bm25("betaterm", 10, None).await.unwrap().is_empty(),
+        "orphaned chunk from a removed section must be deleted"
+    );
+    assert!(idx.bm25("gammaterm", 10, None).await.unwrap().is_empty());
+    assert!(
+        !idx.bm25("alphaterm", 10, None).await.unwrap().is_empty(),
+        "surviving section must remain searchable"
+    );
+    assert!(
+        idx.count_rows().await.unwrap() < rows_big,
+        "row count must shrink when the file loses sections"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_content_under_different_paths_is_indexed_independently() {
+    let (idx, _tmp) = fresh_index().await;
+    // Identical content, two paths — the chunk id folds in the uri, so these
+    // must not collide (the concern called out in `chunk_raw`'s id comment).
+    let body = "# Shared\n\nidenticalcontent appears in both files verbatim\n";
+    let corpus = corpus_with(&[("one.md", body), ("two.md", body)]);
+    run_index(&idx, corpus.path()).await.unwrap();
+
+    let hits = idx.bm25("identicalcontent", 10, None).await.unwrap();
+    let paths: std::collections::HashSet<_> = hits.iter().map(|h| h.path.as_str()).collect();
+    assert_eq!(
+        paths.len(),
+        2,
+        "both files must be indexed despite identical content, got {paths:?}"
+    );
+    assert_eq!(
+        distinct_ids(&hits),
+        hits.len(),
+        "identical content under different paths must get distinct chunk ids"
+    );
+}
+
+#[tokio::test]
 async fn empty_query_returns_empty() {
     let (idx, _tmp) = fresh_index().await;
     run_index(&idx, &fixture_corpus()).await.unwrap();

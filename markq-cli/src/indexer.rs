@@ -112,7 +112,10 @@ pub async fn run_index<I: Index>(idx: &I, root: &Path) -> Result<IndexReport> {
     // Scope the prune to the indexed root: a previously-indexed file outside
     // `root` (e.g. from indexing a sibling directory) is out of this run's
     // scope and must be left alone — only files under `root` that have
-    // vanished get pruned.
+    // vanished get pruned. Both sides of the `starts_with` are canonical: the
+    // stored keys come from `read_raw_file`, which derives `path_str` from a
+    // `WalkDir` walk of the already-canonicalized `root`, so the prefix check
+    // is comparing like with like.
     let mut removed = 0usize;
     for path in existing.keys() {
         if Path::new(path).starts_with(&root) && !seen.contains(path) {
@@ -123,6 +126,14 @@ pub async fn run_index<I: Index>(idx: &I, root: &Path) -> Result<IndexReport> {
         }
     }
 
+    // Non-atomic by necessity: Lance has no cross-operation transaction, so the
+    // per-file edit deletes (above, in the loop) and these prunes commit before
+    // the batched upsert below. If the upsert fails, edited/new files are left
+    // without rows — but re-running `index` heals it: those files are no longer
+    // in `existing`, so they're treated as new and re-indexed. (Edited files
+    // must delete-then-add rather than add-then-delete because `delete_by_path`
+    // is path-scoped and would otherwise remove the just-added replacement
+    // rows, which share the path.)
     if !row_files.is_empty() {
         let batch = build_record_batch(&schema, &row_files)?;
         debug!(rows = batch.num_rows(), "upserting batch");
