@@ -88,18 +88,33 @@ jobs:
           echo "tarball=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
 
       - name: Upload workflow artifact
-        # Always keep the build output as a downloadable artifact, even on
-        # manual (non-tag) runs where no release is created.
+        # Each variant publishes its tarball + checksum as a workflow artifact.
+        # On tag pushes the `release` job below collects them; on manual runs
+        # they remain downloadable directly from the run.
         uses: actions/upload-artifact@v4
         with:
           name: markq-linux-x86_64-${{ matrix.variant }}
           path: dist/*.tar.gz*
 
+  # Single upload job so only one process touches the GitHub Release. Running
+  # the per-variant attach concurrently inside the matrix lets both jobs race
+  # to *create* the not-yet-existing release, and one loses with a 422 — which,
+  # under fail-fast: false, would silently drop that variant's binary from the
+  # release. Gating this on tag pushes keeps manual runs release-free.
+  release:
+    name: attach to GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
       - name: Attach to GitHub Release
-        # Only on tag pushes — creates the release if absent, appends assets.
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/*.tar.gz
-            dist/*.tar.gz.sha256
+            dist/**/*.tar.gz
+            dist/**/*.tar.gz.sha256
