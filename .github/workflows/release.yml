@@ -1,0 +1,99 @@
+name: Release
+
+# Build prebuilt Linux binaries and attach them to a GitHub Release.
+#
+# Triggers on annotated/lightweight tags shaped `vX.Y.Z`. Also exposed via
+# workflow_dispatch so the build can be exercised manually before tagging
+# (manual runs build the artifacts but skip the release-upload step).
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# The release-upload step creates/updates a GitHub Release, which needs write
+# access to repository contents.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # .cargo/config.toml hard-codes the Fedora clang resource directory. Ubuntu's
+  # clang co-locates it, so bindgen finds the headers without help; clearing the
+  # var avoids passing a -isystem path that doesn't exist on the runner.
+  BINDGEN_EXTRA_CLANG_ARGS: ""
+
+jobs:
+  build:
+    # ubuntu-22.04 pins the glibc floor at 2.35. Binaries built here run on any
+    # distro with glibc >= 2.35 (Ubuntu 22.04+, Debian 12+, Fedora 36+). Bump
+    # the runner only when you intend to raise that floor.
+    runs-on: ubuntu-22.04
+    strategy:
+      # Don't let a Vulkan-toolchain hiccup block shipping the CPU build.
+      fail-fast: false
+      matrix:
+        include:
+          - variant: cpu
+            features: ""
+          - variant: vulkan
+            features: "--features vulkan"
+
+    name: build (linux-x86_64-${{ matrix.variant }})
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        # clang/libclang: bindgen FFI generation in llama-cpp-sys-2.
+        # cmake: llama.cpp's build (preinstalled on the runner, pinned for clarity).
+        # protobuf-compiler: lance-encoding build script invokes protoc.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake protobuf-compiler
+
+      - name: Install Vulkan toolchain
+        if: matrix.variant == 'vulkan'
+        # libvulkan-dev: Vulkan loader + headers to compile the backend.
+        # glslc (shaderc): llama.cpp compiles its Vulkan compute shaders at build
+        #   time via glslc. If this package is unavailable on the runner, switch
+        #   to the LunarG Vulkan SDK apt repo (packages.lunarg.com).
+        run: sudo apt-get install -y libvulkan-dev glslc
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.variant }}
+
+      - name: Build
+        run: cargo build --release --locked -p markq-cli ${{ matrix.features }}
+
+      - name: Package
+        id: package
+        run: |
+          ver="${GITHUB_REF_NAME}"
+          name="markq-${ver}-linux-x86_64-${{ matrix.variant }}"
+          mkdir -p "dist/${name}"
+          cp target/release/markq "dist/${name}/"
+          cp README.md LICENSE "dist/${name}/" 2>/dev/null || true
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          echo "tarball=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        # Always keep the build output as a downloadable artifact, even on
+        # manual (non-tag) runs where no release is created.
+        uses: actions/upload-artifact@v4
+        with:
+          name: markq-linux-x86_64-${{ matrix.variant }}
+          path: dist/*.tar.gz*
+
+      - name: Attach to GitHub Release
+        # Only on tag pushes — creates the release if absent, appends assets.
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
