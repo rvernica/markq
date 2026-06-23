@@ -53,11 +53,17 @@ jobs:
 
       - name: Install Vulkan toolchain
         if: matrix.variant == 'vulkan'
-        # libvulkan-dev: Vulkan loader + headers to compile the backend.
-        # glslc (shaderc): llama.cpp compiles its Vulkan compute shaders at build
-        #   time via glslc. If this package is unavailable on the runner, switch
-        #   to the LunarG Vulkan SDK apt repo (packages.lunarg.com).
-        run: sudo apt-get install -y libvulkan-dev glslc
+        # llama.cpp's Vulkan backend compiles its compute shaders at build time
+        # with glslc (shaderc), which Ubuntu's own apt repos don't ship. The
+        # LunarG Vulkan SDK repo provides glslc plus the loader/headers via the
+        # `vulkan-sdk` meta-package. `jammy` matches ubuntu-22.04.
+        run: |
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc > /dev/null
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list \
+            https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
