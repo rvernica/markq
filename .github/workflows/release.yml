@@ -91,7 +91,7 @@ jobs:
         # Each variant publishes its tarball + checksum as a workflow artifact.
         # On tag pushes the `release` job below collects them; on manual runs
         # they remain downloadable directly from the run.
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: markq-linux-x86_64-${{ matrix.variant }}
           path: dist/*.tar.gz*
@@ -108,7 +108,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v7
         with:
           path: dist
 
