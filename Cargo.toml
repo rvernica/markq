@@ -12,9 +12,10 @@ members = [
 # small, self-contained executable. The llama.cpp CMake build dominates compile
 # time regardless, so codegen-units = 1 + thin LTO cost little extra wall time.
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 strip = true
+panic = "abort"
 
 [workspace.package]
 version = "0.1.0"
