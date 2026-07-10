@@ -31,8 +31,17 @@ pub async fn run_rerank<R: Read, W: Write>(
     instruction: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    let candidates: Vec<Candidate> =
+    let raw: Vec<serde_json::Value> =
         serde_json::from_reader(reader).context("parse candidates JSON from stdin")?;
+
+    if raw.is_empty() {
+        if json {
+            writeln!(writer, "[]")?;
+        }
+        return Ok(());
+    }
+
+    let candidates = parse_and_validate_candidates(raw)?;
 
     let model_path = ensure_model(KnownModel::Qwen3Reranker06B)
         .await
@@ -58,6 +67,34 @@ pub async fn run_rerank<R: Read, W: Write>(
     }
 
     Ok(())
+}
+
+/// Validate each raw JSON element has a non-empty string `id` and non-empty
+/// string `text` before converting it to a [`Candidate`], so a malformed
+/// element can be reported with its 0-based index — a bare
+/// `serde_json::from_reader::<Vec<Candidate>>` can't name the offending
+/// element. Bails on the first violation found (in index order).
+fn parse_and_validate_candidates(raw: Vec<serde_json::Value>) -> Result<Vec<Candidate>> {
+    raw.into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            for field in ["id", "text"] {
+                match value.get(field).and_then(|v| v.as_str()) {
+                    Some(s) if !s.is_empty() => {}
+                    Some(_) => {
+                        anyhow::bail!("candidate at index {index} has an empty {field:?} field");
+                    }
+                    None => {
+                        anyhow::bail!(
+                            "candidate at index {index} is missing required field {field:?}"
+                        );
+                    }
+                }
+            }
+            serde_json::from_value(value)
+                .with_context(|| format!("parse candidate at index {index}"))
+        })
+        .collect()
 }
 
 /// Model-independent core of `run_rerank`: given `candidates` and their
@@ -137,6 +174,19 @@ mod tests {
         assert_eq!(reranked[1].rank, 2);
         assert_eq!(reranked[2].id, "a");
         assert_eq!(reranked[2].rank, 3);
+    }
+
+    #[test]
+    fn single_candidate_assembles_to_rank_one() {
+        let candidates = vec![candidate("a", "alpha", Map::new())];
+        let scores = [0.42];
+
+        let reranked = assemble_ranked(candidates, &scores, None);
+
+        assert_eq!(reranked.len(), 1);
+        assert_eq!(reranked[0].id, "a");
+        assert_eq!(reranked[0].rank, 1);
+        assert_eq!(reranked[0].rerank_score, 0.42);
     }
 
     #[test]
