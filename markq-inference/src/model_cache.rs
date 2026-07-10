@@ -14,13 +14,16 @@ use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 /// Curated set of GGUFs markq knows how to fetch. Each new model that's
-/// needed adds an entry. v1 only ships the embedder; a reranker and HyDE
-/// generator will join this list later.
+/// needed adds an entry. v1 ships the embedder and a cross-encoder reranker;
+/// a HyDE generator will join this list later.
 #[derive(Debug, Clone, Copy)]
 pub enum KnownModel {
     /// Qwen3-Embedding-0.6B, Q8_0 quantization (the smallest GGUF the upstream
     /// repo publishes — no Q4_K_M variant exists at the time of writing).
     Qwen3Embedding06B,
+    /// Qwen3-Reranker-0.6B, Q8_0 quantization. Used for cross-encoder reranking
+    /// in hybrid search.
+    Qwen3Reranker06B,
 }
 
 impl KnownModel {
@@ -28,6 +31,7 @@ impl KnownModel {
     pub fn repo(self) -> (&'static str, &'static str) {
         match self {
             KnownModel::Qwen3Embedding06B => ("Qwen", "Qwen3-Embedding-0.6B-GGUF"),
+            KnownModel::Qwen3Reranker06B => ("ggml-org", "Qwen3-Reranker-0.6B-Q8_0-GGUF"),
         }
     }
 
@@ -35,6 +39,7 @@ impl KnownModel {
     pub fn filename(self) -> &'static str {
         match self {
             KnownModel::Qwen3Embedding06B => "Qwen3-Embedding-0.6B-Q8_0.gguf",
+            KnownModel::Qwen3Reranker06B => "qwen3-reranker-0.6b-q8_0.gguf",
         }
     }
 
@@ -44,6 +49,7 @@ impl KnownModel {
     pub fn id(self) -> &'static str {
         match self {
             KnownModel::Qwen3Embedding06B => "Qwen/Qwen3-Embedding-0.6B-GGUF/Q8_0",
+            KnownModel::Qwen3Reranker06B => "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/Q8_0",
         }
     }
 
@@ -56,6 +62,10 @@ impl KnownModel {
             // after the first known-good download; until then the verifier
             // logs a warning and accepts whatever is on disk.
             KnownModel::Qwen3Embedding06B => None,
+            // TODO: record the digest of the Qwen3-Reranker GGUF
+            // after the first known-good download; until then the verifier
+            // logs a warning and accepts whatever is on disk.
+            KnownModel::Qwen3Reranker06B => None,
         }
     }
 }
@@ -198,6 +208,20 @@ mod tests {
         assert!(
             msg.contains(good),
             "error should report actual digest: {msg}"
+        );
+    }
+
+    #[test]
+    fn qwen3_reranker_06b_resolves_to_expected_cache_filename() {
+        let filename = KnownModel::Qwen3Reranker06B.filename();
+        assert_eq!(filename, "qwen3-reranker-0.6b-q8_0.gguf");
+
+        let cache_path = models_dir().join(filename);
+        let cache_path_str = cache_path.to_string_lossy();
+        assert!(
+            cache_path_str.ends_with("markq/models/qwen3-reranker-0.6b-q8_0.gguf"),
+            "expected cache path to end with markq/models/qwen3-reranker-0.6b-q8_0.gguf, got: {}",
+            cache_path_str
         );
     }
 }
