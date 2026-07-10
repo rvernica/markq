@@ -31,13 +31,21 @@ pub struct RerankedCandidate {
 }
 
 impl RerankedCandidate {
+    /// Builds the output element, re-flattening the input `Candidate`'s
+    /// `extra` map. If `extra` already carries stale `rank` / `rerank_score`
+    /// keys (e.g. from piping a previous `markq rerank --json` output back
+    /// in), they are dropped so the fresh typed fields are the sole source
+    /// of truth and serde doesn't emit duplicate JSON keys.
     pub fn new(candidate: Candidate, rerank_score: f32, rank: u32) -> Self {
+        let mut extra = candidate.extra;
+        extra.remove("rank");
+        extra.remove("rerank_score");
         RerankedCandidate {
             id: candidate.id,
             text: candidate.text,
             rerank_score,
             rank,
-            extra: candidate.extra,
+            extra,
         }
     }
 }
