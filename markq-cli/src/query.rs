@@ -11,8 +11,18 @@ use anyhow::{Context, Result};
 use markq_core::{fuse, ChunkHit, FusedHit, FusionConfig, Index};
 use markq_index_lance::LanceIndex;
 use markq_inference::{default_n_gpu_layers, ensure_model, Embedder, KnownModel, Reranker};
+use tracing::warn;
 
 use crate::search::{apply_filters, SearchOptions};
+
+/// Cap on how many fused hits the cross-encoder reranks. Rerank is a
+/// precision SECOND stage over a small candidate set (~20-50, interactive
+/// speed), not a primary retriever, so an unbounded `--all` or large
+/// fan-out must not turn it into an O(pool) cost. When the fused pool
+/// exceeds this, only the top `RERANK_FANIN` fused hits (already in
+/// fusion order) are reranked; the truncation is surfaced via `warn!`
+/// rather than dropped silently.
+const RERANK_FANIN: usize = 64;
 
 pub struct ExplainTrace {
     pub bm25_hits: usize,
@@ -22,6 +32,10 @@ pub struct ExplainTrace {
     pub vector_ms: u128,
     pub fuse_ms: u128,
     pub fused: Vec<FusedHit>,
+    /// Time spent scoring candidates in the rerank stage, and how many
+    /// were scored. `None` when `--rerank` was not requested.
+    pub rerank_ms: Option<u128>,
+    pub rerank_candidates: Option<usize>,
 }
 
 pub struct QueryOutcome {
@@ -99,17 +113,30 @@ pub async fn run_query(
             ..f.hit.clone()
         })
         .collect();
+    let mut rerank_ms = None;
+    let mut rerank_candidates = None;
     let hits = if rerank {
-        // Reranking runs strictly AFTER fusion, over the full fused
-        // candidate pool (`as_hits`), so the final top-k reflects the
-        // cross-encoder's judgment rather than the fused RRF order.
+        // Reranking runs strictly AFTER fusion, but only over the top
+        // `RERANK_FANIN` fused hits (`as_hits` is already in fusion
+        // order) -- rerank is a small-set precision stage, not a
+        // primary retriever, so the final top-k reflects the
+        // cross-encoder's judgment over a bounded fan-in.
+        if as_hits.len() > RERANK_FANIN {
+            warn!(
+                pool = as_hits.len(),
+                cap = RERANK_FANIN,
+                "rerank input truncated to RERANK_FANIN fused hits"
+            );
+        }
+        let fanin = as_hits.len().min(RERANK_FANIN);
         let rerank_model_path = ensure_model(KnownModel::Qwen3Reranker06B)
             .await
             .context("locate reranker model")?;
         let reranker =
             Reranker::load(&rerank_model_path, default_n_gpu_layers()).context("load reranker")?;
-        let mut scores = Vec::with_capacity(as_hits.len());
-        for h in &as_hits {
+        let rerank_t = Instant::now();
+        let mut scores = Vec::with_capacity(fanin);
+        for h in &as_hits[..fanin] {
             scores.push(
                 reranker
                     .score(query, &h.text, None)
@@ -117,6 +144,8 @@ pub async fn run_query(
                     .context("rerank score")?,
             );
         }
+        rerank_ms = Some(rerank_t.elapsed().as_millis());
+        rerank_candidates = Some(fanin);
         let order = markq_inference::order_by_relevance(&scores, None);
         let reordered: Vec<ChunkHit> = order
             .iter()
@@ -139,6 +168,8 @@ pub async fn run_query(
             vector_ms,
             fuse_ms,
             fused,
+            rerank_ms,
+            rerank_candidates,
         })
     } else {
         None
@@ -164,6 +195,9 @@ pub fn write_explain<W: Write>(w: &mut W, trace: &ExplainTrace, shown: &[ChunkHi
         trace.fused.len(),
         trace.fuse_ms
     )?;
+    if let (Some(ms), Some(n)) = (trace.rerank_ms, trace.rerank_candidates) {
+        writeln!(w, "rerank: {n} candidates in {ms}ms")?;
+    }
     writeln!(w)?;
     writeln!(
         w,

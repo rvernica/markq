@@ -134,6 +134,10 @@ struct QueryArgs {
     #[arg(long)]
     explain: bool,
     /// Cross-encoder rerank of the fused candidate pool (query only).
+    /// Results are then ordered by cross-encoder relevance instead of the
+    /// fusion score, and each hit's score becomes that relevance
+    /// probability in [0, 1]; `--min-score` (if given) filters on this
+    /// probability, not the fusion score.
     #[arg(long)]
     rerank: bool,
 }
