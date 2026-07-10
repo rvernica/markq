@@ -21,7 +21,9 @@ use crate::search::{apply_filters, SearchOptions};
 /// fan-out must not turn it into an O(pool) cost. When the fused pool
 /// exceeds this, only the top `RERANK_FANIN` fused hits (already in
 /// fusion order) are reranked; the truncation is surfaced via `warn!`
-/// rather than dropped silently.
+/// rather than dropped silently. This also bounds the RESULT COUNT under
+/// `--rerank`: a larger `-n`/`--all` cannot yield more than `RERANK_FANIN`
+/// results, unlike the non-rerank path.
 const RERANK_FANIN: usize = 64;
 
 pub struct ExplainTrace {
@@ -199,6 +201,14 @@ pub fn write_explain<W: Write>(w: &mut W, trace: &ExplainTrace, shown: &[ChunkHi
         writeln!(w, "rerank: {n} candidates in {ms}ms")?;
     }
     writeln!(w)?;
+    if trace.rerank_ms.is_some() {
+        writeln!(
+            w,
+            "note: rows below are ordered by cross-encoder rerank relevance, \
+             not by the `final` column; `final` still shows the pre-rerank RRF fusion score."
+        )?;
+        writeln!(w)?;
+    }
     writeln!(
         w,
         "{:<4}  {:<12}  {:>8}  {:>15}  {:>15}  {:>6}",
