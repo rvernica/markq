@@ -43,6 +43,18 @@ pub async fn run_rerank<R: Read, W: Write>(
 
     let candidates = parse_and_validate_candidates(raw)?;
 
+    // `top_k == Some(0)` is a degenerate request for zero results:
+    // `assemble_ranked`/`order_by_relevance` would truncate to an empty
+    // output anyway, so short-circuit here (same as the empty-input case
+    // above) rather than paying for a full model load and scoring pass
+    // whose result is discarded.
+    if top_k == Some(0) {
+        if json {
+            writeln!(writer, "[]")?;
+        }
+        return Ok(());
+    }
+
     let model_path = ensure_model(KnownModel::Qwen3Reranker06B)
         .await
         .context("locate reranker model")?;

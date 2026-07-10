@@ -95,6 +95,10 @@ pub async fn run_query(
     let ((bm25_res, bm25_ms), (embed_res, embed_ms)) = tokio::join!(bm25_fut, embed_fut);
     let bm25_hits = bm25_res.context("bm25 search")?;
     let q_vec = embed_res.context("embed query")?;
+    // `embedder` is only needed to produce `q_vec`; drop its resident
+    // `LlamaContext` now so the `--rerank` branch doesn't hold both the
+    // embedder and reranker models in memory at once.
+    drop(embedder);
 
     let vec_t = Instant::now();
     let vec_hits = idx

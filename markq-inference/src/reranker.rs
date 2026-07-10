@@ -286,21 +286,30 @@ fn score_one(
     if tokens.is_empty() {
         return Err(anyhow!("tokenizer returned zero tokens for prompt"));
     }
-    // Belt-and-braces: the budget above should already guarantee this fits,
-    // but never index outside the context window.
-    let take = tokens.len().min(DEFAULT_N_CTX as usize);
+    // The document-budget guard above should already guarantee the rendered
+    // prompt fits within `DEFAULT_N_CTX`. If it somehow doesn't, front-
+    // truncating here (as a silent clamp would) drops the trailing
+    // `<|im_start|>assistant\n<think>...` verdict scaffolding and reads a
+    // meaningless mid-prompt logit position instead of the intended one —
+    // fail loudly rather than silently corrupt the score.
+    if tokens.len() > DEFAULT_N_CTX as usize {
+        return Err(anyhow!(
+            "reranker prompt still exceeds context after document truncation ({} > {DEFAULT_N_CTX}) — internal budgeting error",
+            tokens.len()
+        ));
+    }
 
     let mut batch = LlamaBatch::new(DEFAULT_N_BATCH as usize, 1);
     // `add_sequence(.., false)` marks only the final token as an output, which
     // is exactly the position whose next-token distribution we score.
     batch
-        .add_sequence(&tokens[..take], 0, false)
+        .add_sequence(&tokens, 0, false)
         .context("batch.add_sequence")?;
 
     ctx.decode(&mut batch).context("decode")?;
 
     // Vocab logits at the final position.
-    let last = i32::try_from(take - 1).context("final token index overflows i32")?;
+    let last = i32::try_from(tokens.len() - 1).context("final token index overflows i32")?;
     let logits = ctx.get_logits_ith(last);
 
     let yes_idx = yes_no.yes.0 as usize;

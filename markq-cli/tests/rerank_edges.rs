@@ -32,6 +32,49 @@ async fn empty_array_short_circuits_before_model_load_human() {
 }
 
 #[tokio::test]
+async fn top_k_zero_short_circuits_before_model_load_json() {
+    // Non-empty input, but `top_k == Some(0)` requests zero results, so this
+    // must short-circuit before model load exactly like the empty-array
+    // case above; if it reached `Reranker::load` it would fail here (no
+    // MARKQ_MODELS_DIR / network access configured in this test).
+    let mut buf = Vec::new();
+    run_rerank(
+        br#"[{"id":"a","text":"alpha"}]"#.as_slice(),
+        &mut buf,
+        "q",
+        Some(0),
+        None,
+        true,
+    )
+    .await
+    .expect("top_k=0 must short-circuit to Ok without loading a model");
+
+    let out = String::from_utf8(buf).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON array");
+    assert_eq!(parsed.as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn top_k_zero_short_circuits_before_model_load_human() {
+    let mut buf = Vec::new();
+    run_rerank(
+        br#"[{"id":"a","text":"alpha"}]"#.as_slice(),
+        &mut buf,
+        "q",
+        Some(0),
+        None,
+        false,
+    )
+    .await
+    .expect("top_k=0 must short-circuit to Ok without loading a model");
+
+    // Human output for a zero-result short-circuit is truly empty (not
+    // "(no results)", which is `write_table`'s output for an empty list
+    // reached via the normal scoring path).
+    assert_eq!(buf, Vec::<u8>::new());
+}
+
+#[tokio::test]
 async fn missing_text_field_names_the_offending_index() {
     let mut buf = Vec::new();
     let err = run_rerank(
