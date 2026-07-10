@@ -46,10 +46,8 @@ pub fn detect(src: &str) -> Option<std::ops::Range<usize>> {
             let end = nl.map(|p| p + 1).unwrap_or(bytes.len());
             return Some(0..end);
         }
-        match nl {
-            Some(p) => line_start = p + 1,
-            None => return None,
-        }
+        let p = nl?;
+        line_start = p + 1;
     }
     None
 }
