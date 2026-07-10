@@ -255,7 +255,7 @@ fn score_one(
     // scoring a meaningless mid-prompt position. Fail loudly instead.
     if overhead + TRUNCATION_MARGIN >= DEFAULT_N_CTX as usize {
         return Err(anyhow!(
-            "query/instruction too long to rerank ({overhead} tokens exceeds context {DEFAULT_N_CTX}); shorten the query"
+            "query/instruction too long to rerank ({overhead} tokens leaves no document budget within the {DEFAULT_N_CTX}-token context after a {TRUNCATION_MARGIN}-token margin); shorten the query"
         ));
     }
     let doc_budget = (DEFAULT_N_CTX as usize) - (overhead + TRUNCATION_MARGIN);
