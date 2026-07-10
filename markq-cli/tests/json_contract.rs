@@ -143,7 +143,7 @@ async fn query_json_output_is_candidate_array() {
         top_k: Some(5),
         min_score: None,
     };
-    let outcome = query::run_query(&idx, "how does reranking work", 5, &opts, false)
+    let outcome = query::run_query(&idx, "how does reranking work", 5, &opts, false, false)
         .await
         .unwrap();
     assert!(!outcome.hits.is_empty(), "query returned no hits");

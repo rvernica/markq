@@ -10,7 +10,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use markq_core::{fuse, ChunkHit, FusedHit, FusionConfig, Index};
 use markq_index_lance::LanceIndex;
-use markq_inference::{default_n_gpu_layers, ensure_model, Embedder, KnownModel};
+use markq_inference::{default_n_gpu_layers, ensure_model, Embedder, KnownModel, Reranker};
 
 use crate::search::{apply_filters, SearchOptions};
 
@@ -43,6 +43,7 @@ pub async fn run_query(
     k: usize,
     opts: &SearchOptions,
     explain: bool,
+    rerank: bool,
 ) -> Result<QueryOutcome> {
     let md = idx.metadata().await.context("read dataset metadata")?;
     if md.embedder_model.is_none() || md.embedder_dim.is_none() {
@@ -98,7 +99,36 @@ pub async fn run_query(
             ..f.hit.clone()
         })
         .collect();
-    let filtered = apply_filters(as_hits, opts);
+    let hits = if rerank {
+        // Reranking runs strictly AFTER fusion, over the full fused
+        // candidate pool (`as_hits`), so the final top-k reflects the
+        // cross-encoder's judgment rather than the fused RRF order.
+        let rerank_model_path = ensure_model(KnownModel::Qwen3Reranker06B)
+            .await
+            .context("locate reranker model")?;
+        let reranker =
+            Reranker::load(&rerank_model_path, default_n_gpu_layers()).context("load reranker")?;
+        let mut scores = Vec::with_capacity(as_hits.len());
+        for h in &as_hits {
+            scores.push(
+                reranker
+                    .score(query, &h.text, None)
+                    .await
+                    .context("rerank score")?,
+            );
+        }
+        let order = markq_inference::order_by_relevance(&scores, None);
+        let reordered: Vec<ChunkHit> = order
+            .iter()
+            .map(|&i| ChunkHit {
+                score: scores[i],
+                ..as_hits[i].clone()
+            })
+            .collect();
+        apply_filters(reordered, opts)
+    } else {
+        apply_filters(as_hits, opts)
+    };
 
     let explain_trace = if explain {
         Some(ExplainTrace {
@@ -115,7 +145,7 @@ pub async fn run_query(
     };
 
     Ok(QueryOutcome {
-        hits: filtered,
+        hits,
         explain: explain_trace,
     })
 }

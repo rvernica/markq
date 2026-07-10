@@ -55,7 +55,7 @@ async fn hybrid_query_fuses_lex_and_vec() {
         top_k: Some(3),
         min_score: None,
     };
-    let outcome = query::run_query(&idx, "semantic similarity retrieval", 3, &opts, true)
+    let outcome = query::run_query(&idx, "semantic similarity retrieval", 3, &opts, true, false)
         .await
         .expect("run_query");
 

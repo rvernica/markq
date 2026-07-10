@@ -126,13 +126,16 @@ struct QueryArgs {
     files: bool,
     #[arg(long)]
     all: bool,
-    #[arg(short = 'n', default_value_t = 10)]
+    #[arg(short = 'n', long = "top-k", default_value_t = 10)]
     top_k: usize,
     #[arg(long)]
     min_score: Option<f32>,
     /// Per-stage timing + RRF contribution trace.
     #[arg(long)]
     explain: bool,
+    /// Cross-encoder rerank of the fused candidate pool (query only).
+    #[arg(long)]
+    rerank: bool,
 }
 
 #[derive(Args, Debug)]
@@ -290,6 +293,9 @@ async fn cmd_vsearch(dataset_path: &std::path::Path, args: &QueryArgs) -> Result
     if args.explain {
         anyhow::bail!("--explain is not implemented yet");
     }
+    if args.rerank {
+        anyhow::bail!("--rerank is only supported on `markq query`");
+    }
     let format = match (args.json, args.files) {
         (true, true) => anyhow::bail!("--json and --files are mutually exclusive"),
         (true, false) => search::Format::Json,
@@ -345,7 +351,7 @@ async fn cmd_query(dataset_path: &std::path::Path, args: &QueryArgs) -> Result<(
             .max(1),
     };
 
-    let outcome = query::run_query(&idx, &args.query, k, &opts, args.explain).await?;
+    let outcome = query::run_query(&idx, &args.query, k, &opts, args.explain, args.rerank).await?;
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -381,6 +387,9 @@ async fn cmd_search(dataset_path: &std::path::Path, args: &QueryArgs) -> Result<
     }
     if args.explain {
         anyhow::bail!("--explain is not implemented yet");
+    }
+    if args.rerank {
+        anyhow::bail!("--rerank is only supported on `markq query`");
     }
 
     let format = match (args.json, args.files) {
