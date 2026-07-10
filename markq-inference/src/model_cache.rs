@@ -43,9 +43,9 @@ impl KnownModel {
         }
     }
 
-    /// Stable string identifier recorded in the dataset's user metadata under
-    /// `markq.embedder_model`. The dimension validator on reopen compares
-    /// against this exact value, so it must be stable across markq versions.
+    /// Stable string identifier for this model variant. Must not change across
+    /// markq versions. For embedders, the identifier is recorded in the dataset's
+    /// user metadata under `markq.embedder_model` and validated on dataset reopen.
     pub fn id(self) -> &'static str {
         match self {
             KnownModel::Qwen3Embedding06B => "Qwen/Qwen3-Embedding-0.6B-GGUF/Q8_0",
