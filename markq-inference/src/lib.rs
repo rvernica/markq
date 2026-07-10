@@ -6,6 +6,7 @@
 pub mod backend;
 pub mod embedder;
 pub mod model_cache;
+pub mod reranker;
 
 pub use embedder::Embedder;
 pub use model_cache::{ensure_model, models_dir, sha256_hex, KnownModel};
