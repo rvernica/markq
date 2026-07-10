@@ -245,7 +245,20 @@ fn score_one(
         .str_to_token(&render_prompt(instruction, query, ""), AddBos::Always)
         .context("tokenize template overhead")?
         .len();
-    let doc_budget = (DEFAULT_N_CTX as usize).saturating_sub(overhead + TRUNCATION_MARGIN);
+    // The query/instruction template overhead is shared by every candidate in
+    // a rerank batch. If it alone leaves no room for a document (plus the
+    // truncation margin) within the context window, there is no safe document
+    // budget to fall back to: truncating the document to (near-)empty would
+    // still leave a rendered prompt that saturates or exceeds `DEFAULT_N_CTX`,
+    // and the belt-and-braces `take` clamp below would then front-truncate the
+    // prompt itself, silently discarding the verdict-scaffolding suffix and
+    // scoring a meaningless mid-prompt position. Fail loudly instead.
+    if overhead + TRUNCATION_MARGIN >= DEFAULT_N_CTX as usize {
+        return Err(anyhow!(
+            "query/instruction too long to rerank ({overhead} tokens exceeds context {DEFAULT_N_CTX}); shorten the query"
+        ));
+    }
+    let doc_budget = (DEFAULT_N_CTX as usize) - (overhead + TRUNCATION_MARGIN);
 
     let doc_tokens = model
         .str_to_token(document, AddBos::Never)
@@ -299,12 +312,20 @@ fn score_one(
         .get(no_idx)
         .ok_or_else(|| anyhow!("no token id {no_idx} out of logits range"))?;
 
-    // Two-way softmax over {yes, no} only, computed in a numerically stable
-    // way (subtract the max before exponentiating).
+    Ok(yes_no_softmax(l_yes, l_no))
+}
+
+/// Two-way softmax over the "yes"/"no" logits, computed in a numerically
+/// stable way (subtract the max before exponentiating). Returns `P("yes")` in
+/// `[0, 1]`. Pure and side-effect free: no tokenization, no model access — the
+/// full scoring pipeline's only non-trivial arithmetic, so it's the piece
+/// worth unit testing directly (the rest of `score_one` needs a real model
+/// tokenizer and is exercised only by the gated integration test).
+fn yes_no_softmax(l_yes: f32, l_no: f32) -> f32 {
     let m = l_yes.max(l_no);
     let e_yes = (l_yes - m).exp();
     let e_no = (l_no - m).exp();
-    Ok(e_yes / (e_yes + e_no))
+    e_yes / (e_yes + e_no)
 }
 
 /// Canonical Qwen3-Reranker retrieval instruction, used when the caller
@@ -461,5 +482,49 @@ mod tests {
         let order = order_by_relevance(&scores, Some(0));
 
         assert_eq!(order, Vec::<usize>::new());
+    }
+
+    #[test]
+    fn yes_no_softmax_equal_logits_is_exactly_half() {
+        assert_eq!(yes_no_softmax(0.0, 0.0), 0.5);
+        assert_eq!(yes_no_softmax(3.7, 3.7), 0.5);
+        assert_eq!(yes_no_softmax(-12.0, -12.0), 0.5);
+    }
+
+    #[test]
+    fn yes_no_softmax_is_monotonic_in_each_logit() {
+        assert!(yes_no_softmax(2.0, 0.0) > 0.5, "higher yes-logit -> > 0.5");
+        assert!(yes_no_softmax(0.0, 2.0) < 0.5, "higher no-logit -> < 0.5");
+    }
+
+    #[test]
+    fn yes_no_softmax_is_stable_at_extreme_logits() {
+        let strongly_yes = yes_no_softmax(100.0, -100.0);
+        assert!(strongly_yes.is_finite(), "must not be NaN/inf");
+        assert!((0.0..=1.0).contains(&strongly_yes));
+        assert!(strongly_yes > 0.999);
+
+        let strongly_no = yes_no_softmax(-100.0, 100.0);
+        assert!(strongly_no.is_finite(), "must not be NaN/inf");
+        assert!((0.0..=1.0).contains(&strongly_no));
+        assert!(strongly_no < 0.001);
+    }
+
+    #[test]
+    fn yes_no_softmax_always_within_unit_interval() {
+        for (l_yes, l_no) in [
+            (0.0, 0.0),
+            (1.5, -3.2),
+            (-1.5, 3.2),
+            (50.0, 50.0),
+            (-50.0, -50.0),
+            (1e6, -1e6),
+        ] {
+            let p = yes_no_softmax(l_yes, l_no);
+            assert!(
+                (0.0..=1.0).contains(&p),
+                "yes_no_softmax({l_yes}, {l_no}) = {p} out of [0,1]"
+            );
+        }
     }
 }
