@@ -10,7 +10,7 @@ use markq_core::{default_dataset_path, Index};
 use markq_index_lance::LanceIndex;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use markq_cli::{embed_query, embedder_cmd, indexer, query, search, vsearch};
+use markq_cli::{embed_query, embedder_cmd, indexer, query, rerank, search, vsearch};
 
 /// Version string with the compiled-in inference backend appended, so
 /// `markq --version` reveals whether GPU offload is available without
@@ -61,8 +61,8 @@ enum Command {
     Vsearch(QueryArgs),
     /// Hybrid retrieval (BM25 + vector + RRF).
     Query(QueryArgs),
-    /// Hybrid retrieval + cross-encoder rerank.
-    Rerank(QueryArgs),
+    /// Cross-encoder rerank of stdin candidates.
+    Rerank(RerankArgs),
 
     // === Document fetch ===
     /// Fetch one document by path or `#docid`.
@@ -136,6 +136,21 @@ struct QueryArgs {
 }
 
 #[derive(Args, Debug)]
+struct RerankArgs {
+    /// The query to score every stdin candidate against.
+    #[arg(long)]
+    query: String,
+    /// Keep only the top `k` candidates after reordering.
+    #[arg(long)]
+    top_k: Option<usize>,
+    #[arg(long)]
+    json: bool,
+    /// Override the default retrieval instruction sent to the reranker.
+    #[arg(long)]
+    instruction: Option<String>,
+}
+
+#[derive(Args, Debug)]
 struct GetArgs {
     target: String,
     #[arg(long)]
@@ -206,13 +221,13 @@ async fn main() -> Result<()> {
         Command::EmbedQuery(args) => cmd_embed_query(&dataset_path, &args).await,
         Command::Vsearch(args) => cmd_vsearch(&dataset_path, &args).await,
         Command::Query(args) => cmd_query(&dataset_path, &args).await,
+        Command::Rerank(args) => cmd_rerank(&args).await,
 
         // Every other v1 subcommand has its name + arg shape registered now
         // so `markq --help` matches the final surface; their bodies land
         // later.
         Command::Collection(_)
         | Command::Context(_)
-        | Command::Rerank(_)
         | Command::Get(_)
         | Command::MultiGet(_)
         | Command::Compact
@@ -342,6 +357,22 @@ async fn cmd_query(dataset_path: &std::path::Path, args: &QueryArgs) -> Result<(
         query::write_explain(&mut err, trace, &outcome.hits)?;
     }
     Ok(())
+}
+
+async fn cmd_rerank(args: &RerankArgs) -> Result<()> {
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    rerank::run_rerank(
+        &mut input,
+        &mut out,
+        &args.query,
+        args.top_k,
+        args.instruction.as_deref(),
+        args.json,
+    )
+    .await
 }
 
 async fn cmd_search(dataset_path: &std::path::Path, args: &QueryArgs) -> Result<()> {

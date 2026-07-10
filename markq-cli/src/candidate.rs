@@ -16,6 +16,32 @@ pub struct Candidate {
     pub extra: Map<String, Value>,
 }
 
+/// `markq rerank`'s JSON output element: a `Candidate` annotated with its
+/// cross-encoder relevance score and 1-based rank in the reordered list.
+/// `extra` is flattened through verbatim so passthrough fields (`score`,
+/// `collection`, unknown keys) survive reordering unchanged.
+#[derive(Debug, Clone, Serialize)]
+pub struct RerankedCandidate {
+    pub id: String,
+    pub text: String,
+    pub rerank_score: f32,
+    pub rank: u32,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl RerankedCandidate {
+    pub fn new(candidate: Candidate, rerank_score: f32, rank: u32) -> Self {
+        RerankedCandidate {
+            id: candidate.id,
+            text: candidate.text,
+            rerank_score,
+            rank,
+            extra: candidate.extra,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
