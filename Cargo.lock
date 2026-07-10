@@ -3718,6 +3718,7 @@ dependencies = [
  "markq-core",
  "markq-index-lance",
  "markq-inference",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
