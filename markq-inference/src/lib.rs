@@ -10,6 +10,7 @@ pub mod reranker;
 
 pub use embedder::Embedder;
 pub use model_cache::{ensure_model, models_dir, sha256_hex, KnownModel};
+pub use reranker::Reranker;
 
 /// Default `n_gpu_layers` for `Embedder::load`. Returns 999 (offload every
 /// layer) when the crate is built with the `vulkan` or `cuda` feature, 0
