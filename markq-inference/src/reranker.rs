@@ -30,6 +30,30 @@ pub fn render_prompt(instruction: &str, query: &str, document: &str) -> String {
     )
 }
 
+/// Order candidate indices by relevance score, descending, breaking ties by
+/// ascending original input index. Pure and deterministic: no I/O, no model —
+/// a stable sort over index-enumerated input naturally keeps equal-scored
+/// candidates in their original order, which is what makes reruns
+/// byte-identical.
+///
+/// `top_k` optionally truncates the sorted output to its first `k` entries.
+/// `top_k >= scores.len()` returns every index (no padding, no error);
+/// `top_k == Some(0)` returns an empty vector; `top_k == None` returns all
+/// indices in sorted order.
+pub fn order_by_relevance(scores: &[f32], top_k: Option<usize>) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..scores.len()).collect();
+
+    // Stable sort: equal scores retain their relative (ascending index)
+    // order because `order` starts in ascending index order.
+    order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+
+    if let Some(k) = top_k {
+        order.truncate(k);
+    }
+
+    order
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -41,5 +65,41 @@ mod tests {
         let expected = "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n<Instruct>: Given a web search query, retrieve relevant passages that answer the query\n<Query>: sample query\n<Document>: sample document<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
 
         assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn order_by_relevance_breaks_ties_by_ascending_input_index() {
+        let scores = [0.9, 0.5, 0.9, 0.5];
+
+        let order = order_by_relevance(&scores, None);
+
+        assert_eq!(order, vec![0, 2, 1, 3]);
+    }
+
+    #[test]
+    fn order_by_relevance_truncates_to_top_k() {
+        let scores = [0.9, 0.5, 0.9, 0.5];
+
+        let order = order_by_relevance(&scores, Some(2));
+
+        assert_eq!(order, vec![0, 2]);
+    }
+
+    #[test]
+    fn order_by_relevance_top_k_larger_than_len_returns_all() {
+        let scores = [0.9, 0.5, 0.9, 0.5];
+
+        let order = order_by_relevance(&scores, Some(99));
+
+        assert_eq!(order, vec![0, 2, 1, 3]);
+    }
+
+    #[test]
+    fn order_by_relevance_top_k_zero_returns_empty() {
+        let scores = [0.9, 0.5, 0.9, 0.5];
+
+        let order = order_by_relevance(&scores, Some(0));
+
+        assert_eq!(order, Vec::<usize>::new());
     }
 }
