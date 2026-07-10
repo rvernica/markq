@@ -5,10 +5,13 @@ ships the workspace skeleton, `markq inspect`, `markq index` (markdown
 walk + chunk + FTS index build), `markq search` (BM25 over the FTS
 index), `markq embed` (fills the embedding column via Qwen3-Embedding-
 0.6B Q8_0 over llama.cpp), `markq vsearch` (cosine KNN over the HNSW
-vector index), and `markq query` (hybrid BM25 + vector retrieval fused
-with weighted Reciprocal Rank Fusion). Every other v1 subcommand is
-registered (so `markq --help` shows the final surface) but stubs out at
-runtime. Each will be lit up as the corresponding feature work lands.
+vector index), `markq query` (hybrid BM25 + vector retrieval fused
+with weighted Reciprocal Rank Fusion), and `markq rerank` (cross-encoder
+rerank of piped candidates via Qwen3-Reranker-0.6B Q8_0, also available
+as `query --rerank` for an integrated post-fusion pass). Every other v1
+subcommand is registered (so `markq --help` shows the final surface) but
+stubs out at runtime. Each will be lit up as the corresponding feature
+work lands.
 
 All output below was captured against the default dataset at
 `~/.markq/chunks.lance` after indexing this repo's `README.md`. Paths in
@@ -90,19 +93,27 @@ Per-subcommand help works even on stubs — useful for previewing the final
 flag surface:
 
 ```sh
-markq rerank --help
+markq get --help
 ```
 
 ```
-Hybrid retrieval + cross-encoder rerank
+Fetch one document by path or `#docid`
 
-Usage: markq rerank [OPTIONS] <QUERY>
+Usage: markq get [OPTIONS] <TARGET>
+
+Arguments:
+  <TARGET>
+
+Options:
+      --dataset <DATASET>  Path to the chunk dataset. Defaults to `~/.markq/chunks.lance`
+      --full
+  -h, --help               Print help
 ```
 
 Calling a stub fails fast with exit 1:
 
 ```sh
-markq rerank "anything"
+markq get "anything"
 ```
 
 ```
@@ -118,9 +129,9 @@ Error: not implemented yet
 | `search <query>` | ✅ Implemented (BM25 via Lance inverted index) |
 | `embed` | ✅ Implemented (Qwen3-Embedding-0.6B Q8_0, HNSW index build) |
 | `vsearch <query>` | ✅ Implemented (cosine KNN over the HNSW vector index) |
-| `query <query>` | ✅ Implemented (BM25 + vector + weighted RRF; `--explain` available) |
+| `query <query>` | ✅ Implemented (BM25 + vector + weighted RRF; `--explain` available; `--rerank` for an integrated cross-encoder pass) |
 | `embed-query <query>` | ✅ Implemented (prints the query embedding as JSON for external vector search) |
-| `rerank` | Stub (`not implemented yet`) |
+| `rerank` | ✅ Implemented (cross-encoder rerank of stdin candidates via Qwen3-Reranker-0.6B Q8_0) |
 | `get`, `multi-get`, `compact`, `doctor` | Stub |
 | `status`, `config` | Stub |
 | `collection {add,list,remove}` | Stub |
@@ -420,9 +431,10 @@ Options:
       --json
       --files
       --all
-  -n <TOP_K>                     [default: 10]
+  -n, --top-k <TOP_K>            [default: 10]
       --min-score <MIN_SCORE>
       --explain                  Per-stage timing + RRF contribution trace
+      --rerank                   Cross-encoder rerank of the fused candidate pool (query only). Results are then ordered by cross-encoder relevance instead of the fusion score, and each hit's score becomes that relevance probability in [0, 1]; --min-score (if given) filters on this probability, not the fusion score. Only the top 64 fused candidates are reranked, so combining this with a larger -n/--all is capped at 64 results
 ```
 
 ```sh
@@ -498,6 +510,188 @@ A query against a dataset without embeddings fails the same way
 ```
 Error: no embeddings in this dataset; run `markq embed` first to populate them
 ```
+
+### `--rerank`
+
+`--rerank` adds a cross-encoder pass **after** fusion: it takes the fused
+candidate pool, re-scores every candidate against the query with the
+same Qwen3-Reranker-0.6B Q8_0 model that backs standalone `markq rerank`,
+and reorders the output by that cross-encoder relevance score instead of
+the fusion score. Fusion itself is unchanged — `--rerank` only affects
+what happens to the fused list before it's printed.
+
+```sh
+markq query "how does rank fusion work" --rerank --top-k 5
+```
+
+```
+  1.   1.000  markq://default/rank-fusion.md#0
+     # Rank Fusion in Hybrid Search Rank fusion, most commonly implemented as Reciprocal Rank Fusion (RRF…
+  2.   1.000  markq://default/rank-fusion.md#1
+     Rank fusion, most commonly implemented as Reciprocal Rank Fusion (RRF), combines result lists from m…
+  3.   0.013  markq://default/reranking.md#0
+     # Cross-Encoder Reranking A cross-encoder reranker jointly encodes a query and a candidate passage i…
+  4.   0.001  markq://default/markdown-chunking.md#0
+     # Chunking Markdown Documents Splitting long markdown files into smaller chunks improves retrieval q…
+```
+
+(The demo corpus above has only 4 chunks total, so `--top-k 5` naturally
+returns 4 results — this is corpus-size behavior, not a `--rerank`
+quirk.)
+
+A few things worth calling out:
+
+- `-n`/`--top-k` is a single flag with two names (`-n` is the short
+  alias) — it means "keep this many" whether or not `--rerank` is set.
+- With `--rerank`, only the **top 64** fused candidates are ever sent to
+  the cross-encoder (the fan-in cap that keeps a single reranked query
+  bounded in latency). Passing a larger `-n`/`--top-k`, or `--all`,
+  still caps the reranked result set at 64 — the cross-encoder simply
+  never sees candidates ranked below 64 in the fused list.
+- `--min-score` changes meaning under `--rerank`: normally it filters on
+  the raw fusion score (an unbounded RRF value), but with `--rerank` set
+  it filters on the cross-encoder relevance score instead, which lives
+  in `[0, 1]`. A `--min-score` tuned for fusion scores will not mean the
+  same thing once `--rerank` is added, and vice versa.
+- `--explain`'s per-stage trace gains a `rerank` timing line when
+  `--rerank` is set, alongside the existing `bm25` / `embed` / `vector`
+  / `fuse` lines.
+
+## `markq rerank`
+
+Cross-encoder re-scoring of a candidate list produced by another
+command. `rerank` reads a JSON array of candidates from **stdin** — the
+same shape as `search`/`vsearch`/`query`'s `--json` output — scores each
+one against `--query` with the Qwen3-Reranker-0.6B Q8_0 model, and
+prints them best-first. Unlike `search`/`vsearch`/`query`, `rerank`
+takes no `<QUERY>` positional; the query is always `--query <TEXT>`,
+since the query used for retrieval and the query used for reranking are
+allowed to differ.
+
+```sh
+markq rerank --help
+```
+
+```
+Cross-encoder rerank of stdin candidates
+
+Usage: markq rerank [OPTIONS] --query <QUERY>
+
+Options:
+      --dataset <DATASET>          Path to the chunk dataset. Defaults to `~/.markq/chunks.lance`
+      --query <QUERY>              The query to score every stdin candidate against
+      --top-k <TOP_K>              Keep only the top `k` candidates after reordering
+      --json
+      --instruction <INSTRUCTION>  Override the default retrieval instruction sent to the reranker
+  -h, --help                       Print help
+```
+
+- `--query <TEXT>` (required) — the query every stdin candidate is
+  scored against.
+- `--top-k <N>` — keep only the N highest-scoring candidates; default is
+  all candidates, reordered.
+- `--json` — emit a JSON array of `RerankedCandidate` instead of the
+  human ranked list.
+- `--instruction <TEXT>` — overrides the built-in retrieval instruction
+  template sent to the reranker (advanced use; the default instruction
+  is tuned for retrieval-style queries).
+
+Piping a first-stage `query --json` result straight into `rerank` is the
+standalone flow (equivalent in effect to `query --rerank`, but as two
+separate invocations — useful when the query used to retrieve differs
+from the query used to rerank, or when reranking candidates gathered
+from elsewhere):
+
+```sh
+markq query "how does rank fusion work" --json \
+  | markq rerank --query "how does rank fusion work" --top-k 5 --json
+```
+
+```json
+[
+  {
+    "id": "77c1b2ebf88f14c5f01bdfb698d2a4305ac5fc7eec138a6a1757592c305473d8",
+    "text": "# Rank Fusion in Hybrid Search\n\nRank fusion, most commonly implemented as Reciprocal Rank Fusion (RRF), combines\nresult lists from multiple retrieval systems — such as a lexical BM25 search and\na dense vector similarity search — into a single merged ranking. Each document's\nfused score is the sum of `1 / (k + rank)` across all the lists it appears in,\nwhere `k` is a smoothing constant (commonly 60). Rank fusion works well because\nit only needs the rank position from each retriever, not calibrated scores, so\nit sidesteps the problem of BM25 and cosine-similarity scores living on\nincompatible scales.\n",
+    "rerank_score": 0.9999784,
+    "rank": 1,
+    "chunk_index": 0,
+    "path": "/home/user/rerank-demo/corpus/rank-fusion.md",
+    "score": 0.12213115394115448,
+    "uri": "markq://default/rank-fusion.md"
+  },
+  {
+    "id": "dadeaba4fc572d9fb9fe6945267998ed28d50a53c95546f3b00afe949d507c40",
+    "text": "Rank fusion, most commonly implemented as Reciprocal Rank Fusion (RRF), combines\nresult lists from multiple retrieval systems — such as a lexical BM25 search and\na dense vector similarity search — into a single merged ranking. Each document's\nfused score is the sum of `1 / (k + rank)` across all the lists it appears in,\nwhere `k` is a smoothing constant (commonly 60). Rank fusion works well because\nit only needs the rank position from each retriever, not calibrated scores, so\nit sidesteps the problem of BM25 and cosine-similarity scores living on\nincompatible scales.\n\n## Why hybrid retrieval needs fusion\n\nA pure lexical search misses paraphrases and synonyms. A pure vector search can\ndrift away from exact keyword matches. Rank fusion is the glue that lets a\nhybrid system get the best of both: the precision of exact term matches and the\nrecall of semantic similarity.\n",
+    "rerank_score": 0.9998179,
+    "rank": 2,
+    "chunk_index": 1,
+    "path": "/home/user/rerank-demo/corpus/rank-fusion.md",
+    "score": 0.06177419424057007,
+    "uri": "markq://default/rank-fusion.md"
+  },
+  {
+    "id": "b447669e87cc15a7c4046b7d48c6d7023ccd2c2ed329eace5efefcf881152d98",
+    "text": "# Cross-Encoder Reranking\n\nA cross-encoder reranker jointly encodes a query and a candidate passage in a\nsingle forward pass, producing a relevance score that is typically far more\naccurate than the first-stage bi-encoder or lexical retrieval score. Rerankers\nare usually applied to only the top few dozen candidates from a first-stage\nretriever, since scoring every document in a corpus with a cross-encoder is too\nslow for large collections.\n",
+    "rerank_score": 0.012855237,
+    "rank": 3,
+    "chunk_index": 0,
+    "path": "/home/user/rerank-demo/corpus/reranking.md",
+    "score": 0.029523808509111404,
+    "uri": "markq://default/reranking.md"
+  },
+  {
+    "id": "87ea1d0c13899835b1aa142a4613173f6d00523dd0a340024671e37b9a8491bb",
+    "text": "# Chunking Markdown Documents\n\nSplitting long markdown files into smaller chunks improves retrieval quality.\nA chunker typically respects heading boundaries and keeps code blocks intact,\nproducing chunks of a few hundred to about a thousand tokens each. Overlapping\nchunk boundaries slightly can help preserve context across a chunk split.\n",
+    "rerank_score": 0.0006887511,
+    "rank": 4,
+    "chunk_index": 0,
+    "path": "/home/user/rerank-demo/corpus/markdown-chunking.md",
+    "score": 0.00937500037252903,
+    "uri": "markq://default/markdown-chunking.md"
+  }
+]
+```
+
+The `RerankedCandidate` shape adds `rerank_score` (the cross-encoder
+relevance score in `[0, 1]`) and `rank` (1-based position in the
+reranked output) to each object, while passing through every other
+field the input candidate carried (`id`, `text`, `path`, `uri`,
+`chunk_index`, the original `score`, ...) — nothing from the first
+stage is dropped. Ordering is best-first by `rerank_score`; a fixed
+model + quantization gives byte-identical output ordering for identical
+input, run after run, with ties breaking by input order.
+
+The default (non-`--json`) output is the same ranked-list shape as
+`search`/`vsearch`/`query`, just with the cross-encoder score in the
+score column:
+
+```sh
+echo '[{"id":"a","text":"only one"}]' | markq rerank --query "x"
+```
+
+```
+  1.   0.013  a
+     only one
+```
+
+### Edge cases
+
+An empty candidate array on stdin short-circuits before the reranker
+model is even loaded — no llama.cpp log noise, empty stdout, exit 0:
+
+```sh
+echo '[]' | markq rerank --query "x"
+echo "exit=$?"
+```
+
+```
+exit=0
+```
+
+A single candidate is scored and returned, not dropped (shown above). A
+candidate missing `id` or `text` — or malformed input JSON altogether —
+fails fast with an actionable stderr message rather than skipping the
+bad entry silently.
 
 ## `markq embed-query`
 
