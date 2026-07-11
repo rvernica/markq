@@ -80,7 +80,14 @@ pub async fn run_query(
     let model_path = ensure_model(model).await.context("locate embedder model")?;
     let embedder = Embedder::load(&model_path, default_n_gpu_layers()).context("load embedder")?;
 
-    let k_pre = pre_fusion_k(k);
+    // When reranking, the cross-encoder consumes at most `RERANK_FANIN` fused
+    // candidates, so bound the pre-fusion fetch depth to match. Otherwise
+    // `--rerank --all` (or a large `-n`) would make BM25 + vector retrieval and
+    // fusion do O(dataset) work only to discard everything past the fan-in cap.
+    // `pre_fusion_k` still doubles this, leaving ample headroom to fill the
+    // fan-in window. The non-rerank path is unchanged.
+    let effective_k = if rerank { k.min(RERANK_FANIN) } else { k };
+    let k_pre = pre_fusion_k(effective_k);
 
     let bm25_fut = async {
         let t = Instant::now();
