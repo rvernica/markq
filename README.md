@@ -28,15 +28,20 @@ current build ships:
 - **Hybrid retrieval** (`markq query`) — concurrent BM25 + vector with
   weighted RRF fusion and an `--explain` per-stage timing + contribution
   trace.
+- **Cross-encoder reranking** (`markq rerank`) — re-score first-stage
+  candidates read on stdin (the `--json` output of `search` / `vsearch` /
+  `query`) with the Qwen3-Reranker-0.6B Q8_0 cross-encoder and return them
+  best-first; also available as an opt-in `--rerank` flag on `markq query`
+  that reranks the fused results after fusion.
 - **Query embedding** (`markq embed-query`) — print a query's embedding as
   a JSON array so external tools (DuckDB's `lance_vector_search`, pylance)
   can run their own vector search without loading a GGUF.
 
-The cross-encoder reranker, model-management UX (`doctor` / `models`),
-incremental reindex / `compact`, document fetch (`get` / `multi-get`), MCP
-server, and the multi-collection / context-tree UX are pending — their
-subcommands are registered in the `clap` surface and exit with a structured
-"not implemented yet" until their slice lands. See
+The model-management UX (`doctor` / `models`), incremental reindex /
+`compact`, document fetch (`get` / `multi-get`), MCP server, and the
+multi-collection / context-tree UX are pending — their subcommands are
+registered in the `clap` surface and exit with a structured "not
+implemented yet" until their slice lands. See
 [`usage/markq.md`](usage/markq.md) for the per-command status table.
 
 ## Layout
@@ -47,7 +52,7 @@ subcommands are registered in the `clap` surface and exit with a structured
 | `markq-index-lance`    | LanceDB-backed `Index` implementation                    |
 | `markq-cli`            | The `markq` binary (clap, tracing)                       |
 | `markq-chunker`        | Markdown chunker (heading splits, tree-sitter fenced-code protection, token budgeting) |
-| `markq-inference`      | `llama-cpp-2` embedder on a single owner thread + bounded channel (reranker pending) |
+| `markq-inference`      | `llama-cpp-2` embedder + Qwen3-Reranker cross-encoder, each on a single owner thread + bounded channel |
 
 `usage/` contains runnable docs with real captured output:
 [`markq.md`](usage/markq.md) (CLI surface), [`duckdb.md`](usage/duckdb.md) (SQL access), and
