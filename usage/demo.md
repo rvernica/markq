@@ -5,8 +5,9 @@ Matching 25 (BM25) path: an index, full-text search (FTS), and
 `markq search`. Part 2 covers the vector path: `markq embed`, a
 Hierarchical Navigable Small World (HNSW) index, and `markq vsearch`.
 Part 3 covers hybrid `markq query`, which fuses BM25 and vector
-retrieval with Reciprocal Rank Fusion (RRF). The cross-encoder
-`markq rerank` lands next.
+retrieval with Reciprocal Rank Fusion (RRF). Part 4 covers the
+cross-encoder reranker — `markq rerank` and `query --rerank` — which
+re-scores the top candidates for precision.
 
 All output below is captured from the real binary against a snapshot of
 the [GitHub Docs](https://github.com/github/docs) "get started" section
@@ -430,7 +431,142 @@ lift it above the doc that won BM25 outright (`e47612ab4d1b`, which never
 appears in the vector list). See
 [`markq.md`](markq.md) for the full RRF scoring details.
 
-## 9. What's still gated — the final surface is visible
+## 9. Cross-encoder reranking — `markq rerank` and `query --rerank`
+
+The stages above rank by lexical or vector similarity (and their RRF
+fusion). A cross-encoder reranker adds a precision pass: it reads each
+`(query, chunk)` pair *together* through one model and scores how well
+the chunk answers the query. markq uses Qwen3-Reranker-0.6B Q8_0
+(downloaded once into `~/.cache/markq/models/`, offloaded to the GPU on a
+`vulkan` build just like the embedder). The score is `P("yes")` in
+`[0, 1]` — the model's confidence, as a yes/no judge, that the chunk is
+relevant.
+
+### Integrated — `query --rerank`
+
+`--rerank` reranks the fused hits *after* fusion, in one command. Compare
+the hybrid (RRF) order with the reranked order for the same query:
+
+```sh
+mq query "how do I undo the last commit" -n 5            # hybrid (RRF) order
+```
+
+```
+  1.   0.071  markq://default/using-git/using-git-rebase-on-the-command-line.md#0
+     --- title: Using Git rebase on the command line redirect_from: - /articles/using-git-rebase - /artic…
+  2.   0.060  markq://default/learning-to-code/getting-started-with-git.md#13
+     When {% data variables.product.prodname_copilot_short %} asks what kind of command you're looking fo…
+  3.   0.041  markq://default/using-git/about-git-rebase.md#2
+     To rebase all the commits between another branch and the current branch state, you can enter the fol…
+  4.   0.040  markq://default/using-git/about-git-rebase.md#3
+     To rebase the last few commits in your current branch, you can enter the following command in your s…
+  5.   0.040  markq://default/using-git/using-git-rebase-on-the-command-line.md#1
+     Git gets to the `edit dd1475d` operation, stops, and prints the following message to the terminal: `…
+```
+
+```sh
+mq query "how do I undo the last commit" --rerank -n 5   # reranked order
+```
+
+```
+  1.   0.805  markq://default/using-git/using-git-rebase-on-the-command-line.md#1
+     Git gets to the `edit dd1475d` operation, stops, and prints the following message to the terminal: `…
+  2.   0.722  markq://default/using-git/about-git-rebase.md#3
+     To rebase the last few commits in your current branch, you can enter the following command in your s…
+  3.   0.239  markq://default/using-git/resolving-merge-conflicts-after-a-git-rebase.md#0
+     --- title: Resolving merge conflicts after a Git rebase intro: 'When you perform a `git rebase` oper…
+  4.   0.234  markq://default/using-git/about-git-rebase.md#4
+     <dt><code>fixup</code></dt> <dd>This is similar to <code>squash</code>, but the commit to be merged …
+  5.   0.206  markq://default/using-git/about-git-rebase.md#0
+     --- title: About Git rebase redirect_from: - /rebase - /articles/interactive-rebase - /articles/abou…
+```
+
+RRF put the page's title/frontmatter chunk (`…on-the-command-line.md#0`)
+first because it's lexically dense. The cross-encoder demotes it and
+lifts the chunk that actually explains stopping at an `edit` operation to
+rewrite a commit (`#1`) to the top, keeps the concrete "rebase the last
+few commits" instructions, and pulls in
+`resolving-merge-conflicts-after-a-git-rebase.md` — which wasn't in the
+hybrid top-5 at all. Note the score scale changes: the leading column is
+no longer the RRF score (≈0.04–0.07) but the reranker's `P("yes")`
+(≈0.2–0.8).
+
+Fusion itself is unchanged — `--rerank` only reorders what fusion
+produced. To keep it a fast, small-set precision stage, `query --rerank`
+reranks at most the top 64 fused candidates and bounds retrieval depth to
+match, so `--rerank --all` stays cheap.
+
+### Standalone — pipe any retrieval output through `markq rerank`
+
+`markq rerank` reads a JSON candidate array on stdin — the `--json`
+output of `search`, `vsearch`, or `query` — so retrieval and reranking
+compose as a Unix pipe. The query is passed explicitly with `--query` (it
+is not inferred from the payload), and the cap is `--top-k` (not `-n`):
+
+```sh
+mq query "how do I undo the last commit" --json -n 5 \
+  | mq rerank --query "how do I undo the last commit" --json --top-k 3
+```
+
+```json
+[
+  {
+    "id": "1afdc769c27e49c9b0f8471d8946d8cf5880a40c231af05ede0561b44d06a715",
+    "text": "Git gets to the `edit dd1475d` operation, stops, and pr ...",
+    "rerank_score": 0.80497605,
+    "rank": 1,
+    "chunk_index": 1,
+    "path": "/tmp/gh-docs/content/get-started/using-git/using-git-rebase-on-the-command-line.md",
+    "score": 0.039691708981990814,
+    "uri": "markq://default/using-git/using-git-rebase-on-the-command-line.md"
+  },
+  {
+    "id": "8bb340f869974de559df442114ec44e60e045a7589a89b12a595ce10ff067157",
+    "text": "To rebase the last few commits in your current branch,  ...",
+    "rerank_score": 0.7220729,
+    "rank": 2,
+    "chunk_index": 3,
+    "path": "/tmp/gh-docs/content/get-started/using-git/about-git-rebase.md",
+    "score": 0.04008718952536583,
+    "uri": "markq://default/using-git/about-git-rebase.md"
+  }
+]
+```
+
+Each result keeps its `id` and gains a `rerank_score` and a 1-based
+`rank`; the first-stage fields (`score`, `path`, `uri`, `chunk_index`)
+pass through untouched, so a reranked list can itself be piped onward.
+`rerank` reads stdin and never opens the dataset, so the `--dataset` the
+`mq` helper adds is a harmless no-op.
+
+One difference from the integrated form: standalone `rerank` scores
+exactly the candidates it is handed (here, the query's top 5), whereas
+`query --rerank` reranks the full fused pool before top-k — which is why
+the integrated run above could surface a chunk the piped top-5 never
+included.
+
+### Edge cases
+
+An empty candidate array is a no-op — empty output, exit 0, and the model
+is never loaded:
+
+```sh
+echo '[]' | mq rerank --query "anything"    # (no output, exit 0)
+```
+
+A single candidate is returned as-is (still scored):
+
+```sh
+echo '[{"id":"only","text":"Git rebase lets you rewrite commit history."}]' \
+  | mq rerank --query "how do I undo a commit"
+```
+
+```
+  1.   0.090  only
+     Git rebase lets you rewrite commit history.
+```
+
+## 10. What's still gated — the final surface is visible
 
 These commands all parse but exit with a structured message, so a demo
 viewer can see exactly which slice ships next:
@@ -441,13 +577,10 @@ mq search "x" --explain
 
 mq search "x" -c notes
 # Error: collection filtering is not implemented yet; omit -c for now
-
-mq rerank "x"
-# Error: not implemented yet
 ```
 
-`rerank`, `models`, `doctor`, `compact`, `get`, `multi-get`,
-`collection`, `context`, `serve`, `status`, `config`, and `watch` all
-behave the same way — registered in the clap surface, gated at the
-call site until their slice lands. `query --explain` works; the
-`--explain` / `-c` flags on `search` and `vsearch` are still gated.
+`models`, `doctor`, `compact`, `get`, `multi-get`, `collection`,
+`context`, `serve`, `status`, `config`, and `watch` all behave the same
+way — registered in the clap surface, gated at the call site until their
+slice lands. `query`, `query --rerank`, and standalone `rerank` all work;
+the `--explain` / `-c` flags on `search` and `vsearch` are still gated.
