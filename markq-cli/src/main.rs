@@ -10,7 +10,7 @@ use markq_core::{default_dataset_path, Index};
 use markq_index_lance::LanceIndex;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use markq_cli::{embed_query, embedder_cmd, indexer, query, search, vsearch};
+use markq_cli::{embed_query, embedder_cmd, indexer, query, rerank, search, vsearch};
 
 /// Version string with the compiled-in inference backend appended, so
 /// `markq --version` reveals whether GPU offload is available without
@@ -61,8 +61,8 @@ enum Command {
     Vsearch(QueryArgs),
     /// Hybrid retrieval (BM25 + vector + RRF).
     Query(QueryArgs),
-    /// Hybrid retrieval + cross-encoder rerank.
-    Rerank(QueryArgs),
+    /// Cross-encoder rerank of stdin candidates.
+    Rerank(RerankArgs),
 
     // === Document fetch ===
     /// Fetch one document by path or `#docid`.
@@ -126,13 +126,37 @@ struct QueryArgs {
     files: bool,
     #[arg(long)]
     all: bool,
-    #[arg(short = 'n', default_value_t = 10)]
+    #[arg(short = 'n', long = "top-k", default_value_t = 10)]
     top_k: usize,
     #[arg(long)]
     min_score: Option<f32>,
     /// Per-stage timing + RRF contribution trace.
     #[arg(long)]
     explain: bool,
+    /// Cross-encoder rerank of the fused candidate pool (query only).
+    /// Results are then ordered by cross-encoder relevance instead of the
+    /// fusion score, and each hit's score becomes that relevance
+    /// probability in [0, 1]; `--min-score` (if given) filters on this
+    /// probability, not the fusion score. Only the top 64 fused candidates
+    /// are reranked, so combining this with a larger `-n`/`--all` is capped
+    /// at 64 results.
+    #[arg(long)]
+    rerank: bool,
+}
+
+#[derive(Args, Debug)]
+struct RerankArgs {
+    /// The query to score every stdin candidate against.
+    #[arg(long)]
+    query: String,
+    /// Keep only the top `k` candidates after reordering.
+    #[arg(long)]
+    top_k: Option<usize>,
+    #[arg(long)]
+    json: bool,
+    /// Override the default retrieval instruction sent to the reranker.
+    #[arg(long)]
+    instruction: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -206,13 +230,13 @@ async fn main() -> Result<()> {
         Command::EmbedQuery(args) => cmd_embed_query(&dataset_path, &args).await,
         Command::Vsearch(args) => cmd_vsearch(&dataset_path, &args).await,
         Command::Query(args) => cmd_query(&dataset_path, &args).await,
+        Command::Rerank(args) => cmd_rerank(&args).await,
 
         // Every other v1 subcommand has its name + arg shape registered now
         // so `markq --help` matches the final surface; their bodies land
         // later.
         Command::Collection(_)
         | Command::Context(_)
-        | Command::Rerank(_)
         | Command::Get(_)
         | Command::MultiGet(_)
         | Command::Compact
@@ -275,6 +299,9 @@ async fn cmd_vsearch(dataset_path: &std::path::Path, args: &QueryArgs) -> Result
     if args.explain {
         anyhow::bail!("--explain is not implemented yet");
     }
+    if args.rerank {
+        anyhow::bail!("--rerank is only supported on `markq query`");
+    }
     let format = match (args.json, args.files) {
         (true, true) => anyhow::bail!("--json and --files are mutually exclusive"),
         (true, false) => search::Format::Json,
@@ -330,7 +357,7 @@ async fn cmd_query(dataset_path: &std::path::Path, args: &QueryArgs) -> Result<(
             .max(1),
     };
 
-    let outcome = query::run_query(&idx, &args.query, k, &opts, args.explain).await?;
+    let outcome = query::run_query(&idx, &args.query, k, &opts, args.explain, args.rerank).await?;
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -344,12 +371,31 @@ async fn cmd_query(dataset_path: &std::path::Path, args: &QueryArgs) -> Result<(
     Ok(())
 }
 
+async fn cmd_rerank(args: &RerankArgs) -> Result<()> {
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    rerank::run_rerank(
+        &mut input,
+        &mut out,
+        &args.query,
+        args.top_k,
+        args.instruction.as_deref(),
+        args.json,
+    )
+    .await
+}
+
 async fn cmd_search(dataset_path: &std::path::Path, args: &QueryArgs) -> Result<()> {
     if args.collection.is_some() {
         anyhow::bail!("collection filtering is not implemented yet; omit -c for now");
     }
     if args.explain {
         anyhow::bail!("--explain is not implemented yet");
+    }
+    if args.rerank {
+        anyhow::bail!("--rerank is only supported on `markq query`");
     }
 
     let format = match (args.json, args.files) {

@@ -202,7 +202,7 @@ fn long_doc_splits_at_heading_boundaries_when_possible() {
             c.text.contains("# Section "),
             "non-first chunk {} missing a `# Section` heading: {:?}",
             c.index,
-            &c.text
+            c.text
         );
     }
 }

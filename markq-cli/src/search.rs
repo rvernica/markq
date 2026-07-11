@@ -93,7 +93,7 @@ fn write_files<W: Write>(w: &mut W, hits: &[ChunkHit]) -> Result<()> {
     Ok(())
 }
 
-fn preview_line(text: &str, max_chars: usize) -> String {
+pub(crate) fn preview_line(text: &str, max_chars: usize) -> String {
     let collapsed: String = text
         .lines()
         .map(|l| l.trim())

@@ -23,6 +23,7 @@ arrow-array.workspace = true
 arrow-schema.workspace = true
 blake3.workspace = true
 clap.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
