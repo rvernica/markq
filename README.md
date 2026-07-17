@@ -10,9 +10,10 @@ retrieval — BM25, vector cosine, RRF fusion, and a cross-encoder reranker —
 Under active development; the core retrieval pipeline works end-to-end. The
 current build ships:
 
-- A Cargo workspace skeleton with the chunk schema and the `Index` trait
-  pinned to their final v1.5 shape (so multi-collection routing and the
-  context tree become additive changes later, not Lance migrations).
+- A Cargo workspace skeleton whose chunk schema already reserves the v1.5
+  columns (`collection`, `uri`, `context_id`) and whose `Index` trait is
+  backend-agnostic — so multi-collection routing and the context tree land
+  as code, not as a Lance schema migration and re-embed.
 - A working **LanceDB** backend that creates `~/.markq/chunks.lance` with
   the schema and writes versioning metadata (`markq.schema_version`,
   `markq.lance_manifest_version`, `markq.lance_file_format_version`,
