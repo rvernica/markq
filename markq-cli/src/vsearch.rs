@@ -13,7 +13,7 @@ use crate::search::{apply_filters, SearchOptions};
 use markq_core::ChunkHit;
 
 /// Embed `query` and run vector KNN. `k` is the post-fetch cap; the caller
-/// derives it from `--all` / `-n` / row count just like `markq search`.
+/// derives it from `--all` / `--top-k` (`-n`) / row count just like `markq search`.
 ///
 /// Returns a `Vec<ChunkHit>` with scores in `[-1, 1]` where higher is more
 /// similar (cosine similarity = `1 - cosine_distance`).

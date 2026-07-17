@@ -138,8 +138,8 @@ struct QueryArgs {
     /// fusion score, and each hit's score becomes that relevance
     /// probability in [0, 1]; `--min-score` (if given) filters on this
     /// probability, not the fusion score. Only the top 64 fused candidates
-    /// are reranked, so combining this with a larger `-n`/`--all` is capped
-    /// at 64 results.
+    /// are reranked, so combining this with a larger `--top-k` (`-n`) or
+    /// `--all` is capped at 64 results.
     #[arg(long)]
     rerank: bool,
 }

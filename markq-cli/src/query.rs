@@ -1,7 +1,7 @@
 //! Hybrid retrieval: BM25 + vector embedded query + weighted RRF fusion.
 //!
 //! Reuses `search::{Format, SearchOptions, apply_filters, write_results}`
-//! for output, so `--json` / `--files` / `--all` / `-n` / `--min-score`
+//! for output, so `--json` / `--files` / `--all` / `--top-k` (`-n`) / `--min-score`
 //! behave identically to `markq search` and `markq vsearch`.
 
 use std::io::Write;
@@ -22,8 +22,8 @@ use crate::search::{apply_filters, SearchOptions};
 /// exceeds this, only the top `RERANK_FANIN` fused hits (already in
 /// fusion order) are reranked; the truncation is surfaced via `warn!`
 /// rather than dropped silently. This also bounds the RESULT COUNT under
-/// `--rerank`: a larger `-n`/`--all` cannot yield more than `RERANK_FANIN`
-/// results, unlike the non-rerank path.
+/// `--rerank`: a larger `--top-k` (`-n`) or `--all` cannot yield more than
+/// `RERANK_FANIN` results, unlike the non-rerank path.
 const RERANK_FANIN: usize = 64;
 
 pub struct ExplainTrace {
@@ -82,7 +82,7 @@ pub async fn run_query(
 
     // When reranking, the cross-encoder consumes at most `RERANK_FANIN` fused
     // candidates, so bound the pre-fusion fetch depth to match. Otherwise
-    // `--rerank --all` (or a large `-n`) would make BM25 + vector retrieval and
+    // `--rerank --all` (or a large `--top-k` (`-n`)) would make BM25 + vector retrieval and
     // fusion do O(dataset) work only to discard everything past the fan-in cap.
     // `pre_fusion_k` still doubles this, leaving ample headroom to fill the
     // fan-in window. The non-rerank path is unchanged.

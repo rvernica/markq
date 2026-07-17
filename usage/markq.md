@@ -217,7 +217,7 @@ Caused by:
     No such file or directory (os error 2)
 ```
 
-Passing `--collection <name>` is parsed but not yet enforced — everything currently
+Passing `--collection` (`-c`) `<name>` is parsed but not yet enforced — everything currently
 lands in the `default` collection. The chunks are addressable via the
 `uri` column as `markq://<collection>/`.
 
@@ -242,7 +242,7 @@ markq search "lance"
 ```
 
 Each line is `rank. score uri/#chunk_index` followed by a text preview.
-Default `-n` is 10. Empty result sets print `(no results)`:
+Default `--top-k` (`-n`) is 10. Empty result sets print `(no results)`:
 
 ```sh
 markq search "nonexistent_term_xyz"
@@ -254,13 +254,13 @@ markq search "nonexistent_term_xyz"
 
 ### Useful flags
 
-- `-n <K>` — top-K (default 10).
+- `--top-k` (`-n`) `<K>` — top-K (default 10).
 - `--min-score <F>` — filter results below the BM25 score threshold.
 - `--files` — print just the file paths (one per line, deduped).
 - `--json` — emit the full result rows as a JSON array.
 - `--all` — search across all collections (currently a no-op since only
   `default` exists).
-- `--explain` and `--collection <name>` — recognized but stubbed; exit with
+- `--explain` and `--collection` (`-c`) `<name>` — recognized but stubbed; exit with
   a "not implemented yet" error rather than silently misbehaving.
 
 ```sh
@@ -337,6 +337,15 @@ Ctrl-C drains cleanly: the in-flight batch finishes (decoding is never
 aborted mid-batch), the result is flushed, and the process exits. No
 partial-batch corruption.
 
+**What about the vector and FTS indexes?** Both are rebuilt once at the end
+of the run, not per batch. A graceful Ctrl-C still runs that rebuild over
+whatever was embedded so far, so the indexes stay consistent with the data.
+A *hard* kill (SIGKILL, crash, power loss) mid-run skips the rebuild:
+embedded rows are still durable, but because each batch's merge-insert
+rewrites row fragments, the FTS index is left stale (BM25 degrades) and the
+vector index is absent or stale. Re-running `markq embed` embeds the
+remaining rows and rebuilds both indexes, restoring consistency.
+
 The embedder thread holds the model in RAM only for the lifetime of the
 `markq embed` invocation. Re-runs reload the weights, but llama.cpp
 memory-maps the GGUF and the file's pages stay in the OS page cache,
@@ -377,10 +386,10 @@ The score column is the **cosine similarity** (`1 - distance`); higher
 is better, matching the BM25 convention. Values sit in `[-1, 1]` —
 unlike BM25 scores which are unbounded log-domain numbers.
 
-`--json`, `--files`, `-n`, `--min-score`, and `--all` all work the
+`--json`, `--files`, `--top-k` (`-n`), `--min-score`, and `--all` all work the
 same as `markq search` (the formatters are shared). `--explain` is
 recognized but gated on `vsearch` — for explained retrieval, use
-`markq query --explain`. `-c/--collection` is gated until the
+`markq query --explain`. `--collection` (`-c`) is gated until the
 multi-collection wiring lands.
 
 Running `vsearch` against a dataset without embeddings produces a clean
@@ -395,9 +404,13 @@ markq --dataset /tmp/empty.lance vsearch "anything"
 Error: no embeddings in this dataset; run `markq embed` first to populate them
 ```
 
-(Running `vsearch` against a path that doesn't exist at all is a separate
-error — `markq` no longer materializes a fresh dataset behind a read-only
-command: `Error: dataset not found at /tmp/missing.lance (run `markq index <path>` first)`.)
+Running `vsearch` against a path that doesn't exist at all is a separate
+error. A read-only command won't create a dataset on the fly, so it fails
+rather than silently returning nothing:
+
+```
+Error: dataset not found at /tmp/missing.lance (run `markq index <path>` first)
+```
 
 Same shape if the dataset was embedded with a model this binary doesn't
 know about:
@@ -434,7 +447,7 @@ Options:
   -n, --top-k <TOP_K>            [default: 10]
       --min-score <MIN_SCORE>
       --explain                  Per-stage timing + RRF contribution trace
-      --rerank                   Cross-encoder rerank of the fused candidate pool (query only). Results are then ordered by cross-encoder relevance instead of the fusion score, and each hit's score becomes that relevance probability in [0, 1]; --min-score (if given) filters on this probability, not the fusion score. Only the top 64 fused candidates are reranked, so combining this with a larger -n/--all is capped at 64 results
+      --rerank                   Cross-encoder rerank of the fused candidate pool (query only). Results are then ordered by cross-encoder relevance instead of the fusion score, and each hit's score becomes that relevance probability in [0, 1]; `--min-score` (if given) filters on this probability, not the fusion score. Only the top 64 fused candidates are reranked, so combining this with a larger `--top-k` (`-n`) or `--all` is capped at 64 results
 ```
 
 ```sh
@@ -462,7 +475,7 @@ are not currently exposed as CLI flags — tuning lives in
 `FusionConfig::default()` in `markq-core`. Absolute values have no
 meaning across queries — only the within-query ordering does.
 
-`--json`, `--files`, `-n`, `--min-score`, and `--all` behave identically
+`--json`, `--files`, `--top-k` (`-n`), `--min-score`, and `--all` behave identically
 to `markq search` and `markq vsearch`.
 
 ### `--explain`
@@ -500,9 +513,10 @@ appear there (`(  - ,   - )`). Same shape for `vec`. `bonus` is the
 top-rank bonus contribution (0 if the document was ranked 4+ in every
 list).
 
-The fetch depth before fusion is `max(2 * -n, 20)` — each side is
-over-fetched so the fused top-k has real candidates when the two lists
-disagree near the head, with a floor of 20 for very small `-n`.
+The fetch depth before fusion is `max(2 × n, 20)`, where `n` is the
+requested `--top-k` (`-n`) — each side is over-fetched so the fused top-k
+has real candidates when the two lists disagree near the head, with a
+floor of 20 for very small `n`.
 
 A query against a dataset without embeddings fails the same way
 `vsearch` does, with no model load:
@@ -545,7 +559,7 @@ A few things worth calling out:
   alias) — it means "keep this many" whether or not `--rerank` is set.
 - With `--rerank`, only the **top 64** fused candidates are ever sent to
   the cross-encoder (the fan-in cap that keeps a single reranked query
-  bounded in latency). Passing a larger `-n`/`--top-k`, or `--all`,
+  bounded in latency). Passing a larger `--top-k` (`-n`), or `--all`,
   still caps the reranked result set at 64 — the cross-encoder simply
   never sees candidates ranked below 64 in the fused list.
 - `--min-score` changes meaning under `--rerank`: normally it filters on

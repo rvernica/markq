@@ -40,9 +40,10 @@ mq() { ./target/release/markq --dataset "$DS" "$@"; }
 
 `--dataset` overrides the default `~/.markq/chunks.lance` so the demo
 runs against a throwaway dataset and leaves the user's index alone. The
-`--features vulkan` build accelerates `embed`/`vsearch`/`query` on a GPU
-(see §6); the plain build runs the same model on CPU and produces
-identical embeddings, just slower.
+`--features vulkan` build accelerates every model stage — `embed`,
+`vsearch`, `query`, and `rerank` — on a GPU (the device-selection log is
+shown in [§6](#6-embed-the-corpus--markq-embed)); the plain build runs the
+same model on CPU and produces identical embeddings, just slower.
 
 `--version` reports which build you have — the compiled-in inference
 backend is appended in parentheses, so there's no need to inspect the
@@ -119,10 +120,14 @@ lance_file_format_version: 2.0
 lancedb_crate_version:     0.27.2
 ```
 
-The schema is the final v1.5 shape — columns reserved for the context
-tree and multi-collection routing are already there, just unused.
+The schema already reserves the `collection`, `uri`, and `context_id`
+columns that multi-collection routing and the context tree will use —
+present but unused today, so those features can land as plain code rather
+than a Lance schema migration and full re-embed. (`schema_version` is `1`;
+reserving the columns up front is exactly what lets it stay at `1` when
+those features ship, instead of bumping to a migrated version.)
 
-## 3. BM25 search — the headline command
+## 3. BM25 search — fast keyword retrieval
 
 ```sh
 mq search "pull request review" -n 5
@@ -208,9 +213,10 @@ mq search "command palette" --min-score 8.0 -n 4
      When you open the command palette, the suggestions are optimized to give you easy access from anywhe…
 ```
 
-`--all` removes the top-k cap entirely — `k` is sized from the dataset
-row count, so no match above the score floor is dropped. Useful for
-piping every match into another tool.
+`--all` removes the top-k cap entirely: instead of capping at `--top-k`
+(`-n`), markq requests as many hits as there are rows in the dataset, so
+every match above the score floor is returned rather than just the top `k`.
+Useful for piping every match into another tool.
 
 ## 5. Hyphenated identifiers recall correctly
 
@@ -282,7 +288,7 @@ embedded 740 row(s) over 3 batch(es) (model=Qwen/Qwen3-Embedding-0.6B-GGUF/Q8_0,
 ```
 
 On the `--features vulkan` build (confirm with `markq --version`, see
-§Setup) the model offloads to the GPU. With `RUST_LOG=info` the device
+[§Setup](#setup)) the model offloads to the GPU. With `RUST_LOG=info` the device
 selection is visible (this run used an NVIDIA T1200 over Vulkan; the
 default log level keeps it quiet):
 
@@ -367,9 +373,9 @@ mq vsearch "how do I review someone else's code changes" -n 2 --json
 ]
 ```
 
-`--files`, `--min-score`, `--all`, and `-n` work identically to
+`--files`, `--min-score`, `--all`, and `--top-k` (`-n`) work identically to
 `markq search` (the formatter module is shared). `--explain` and
-`-c/--collection` are recognized but gated until that work lands.
+`--collection` (`-c`) are recognized but gated until that work lands.
 
 `vsearch` against a dataset that hasn't been embedded errors clearly
 without loading the model:
@@ -501,7 +507,9 @@ match, so `--rerank --all` stays cheap.
 `markq rerank` reads a JSON candidate array on stdin — the `--json`
 output of `search`, `vsearch`, or `query` — so retrieval and reranking
 compose as a Unix pipe. The query is passed explicitly with `--query` (it
-is not inferred from the payload), and the cap is `--top-k` (not `-n`):
+is not inferred from the payload), and the result cap is spelled `--top-k`
+— unlike `search`/`vsearch`/`query`, the `rerank` subcommand defines no
+`-n` short alias, so `--top-k` is the only spelling here:
 
 ```sh
 mq query "how do I undo the last commit" --json -n 5 \
@@ -583,4 +591,5 @@ mq search "x" -c notes
 `context`, `serve`, `status`, `config`, and `watch` all behave the same
 way — registered in the clap surface, gated at the call site until their
 slice lands. `query`, `query --rerank`, and standalone `rerank` all work;
-the `--explain` / `-c` flags on `search` and `vsearch` are still gated.
+the `--explain` / `--collection` (`-c`) flags on `search` and `vsearch` are
+still gated.
