@@ -196,3 +196,41 @@ async fn downloads_of_different_models_do_not_block() {
         result.err()
     );
 }
+
+#[tokio::test]
+async fn failed_verification_leaves_no_loadable_model() {
+    let model = KnownModel::Qwen3Embedding06B;
+    let hub = FakeHub::spawn_for(
+        model.filename(),
+        sample_content(),
+        Behavior::WrongDeclaredDigest,
+    )
+    .await;
+    let client = HFClient::builder()
+        .endpoint(hub.endpoint())
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join(model.filename());
+
+    let error = download_model(&client, model, dir.path())
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("digest"),
+        "expected a digest complaint, got: {error}"
+    );
+
+    // A file markq knows failed its own digest check must not be left where a
+    // later load would mistake it for an operator-staged file.
+    assert!(
+        !target.exists(),
+        "a file that failed verification is sitting at the model's own path"
+    );
+    assert_eq!(
+        CacheEntry::inspect(ModelRole::Embedder, dir.path())
+            .unwrap()
+            .state,
+        CacheState::Partial { bytes: 4096 }
+    );
+}

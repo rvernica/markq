@@ -160,13 +160,10 @@ pub async fn download_model(
         .into());
     }
 
-    std::fs::rename(&partial, &target)
-        .with_context(|| format!("rename into {}", target.display()))?;
-
     let declared = declared_digest(client, model)
         .await
         .with_context(|| format!("read declared digest for {}", model.filename()))?;
-    verify_and_seal(&target, declared)?;
+    verify_then_seal(&partial, &target, declared)?;
 
     Ok(target)
 }
@@ -174,31 +171,38 @@ pub async fn download_model(
 /// Hash a just-completed download and compare it against the digest the hub
 /// declared for it, recording the result as a sidecar on a match.
 ///
-/// A sidecar is written only once the hash matches (FR-008a): a mismatch
-/// returns an error and leaves no sidecar, so the file stays on disk as
-/// `Unverified` for inspection rather than being trusted. A repository that
-/// declares no digest at all leaves the file unverified the same way, with
-/// no error, since there is nothing to check it against (FR-011a).
-fn verify_and_seal(target: &Path, declared_digest: Option<String>) -> Result<()> {
-    let Some(expected) = declared_digest else {
-        return Ok(());
-    };
-
-    let found = sha256_hex(target)?;
-    if !found.eq_ignore_ascii_case(&expected) {
-        return Err(markq_core::Error::ModelDigestMismatch {
-            path: target.to_path_buf(),
-            expected,
-            found,
+/// The check runs on the partial file, before the rename, so a file that fails
+/// it never appears under the model's own name. A failure that left it there
+/// would be indistinguishable from a file an operator staged, and the per-load
+/// check passes those through unexamined.
+///
+/// A sidecar is written only once the hash matches (FR-008a). A repository that
+/// declares no digest leaves the file unverified with no error, since there is
+/// nothing to check it against (FR-011a).
+fn verify_then_seal(partial: &Path, target: &Path, declared: Option<String>) -> Result<()> {
+    if let Some(expected) = &declared {
+        let found = sha256_hex(partial)?;
+        if !found.eq_ignore_ascii_case(expected) {
+            return Err(markq_core::Error::ModelDigestMismatch {
+                path: partial.to_path_buf(),
+                expected: expected.clone(),
+                found,
+            }
+            .into());
         }
-        .into());
     }
 
+    std::fs::rename(partial, target)
+        .with_context(|| format!("rename into {}", target.display()))?;
+
+    let Some(digest) = declared else {
+        return Ok(());
+    };
     let size_bytes = std::fs::metadata(target)
         .with_context(|| format!("stat {}", target.display()))?
         .len();
     DigestSidecar {
-        digest: found,
+        digest,
         size_bytes,
         source: "hub lfs metadata".to_string(),
     }
@@ -699,13 +703,20 @@ mod tests {
         let target = dir.path().join("model.gguf");
         std::fs::write(&target, b"hello").unwrap();
 
+        let partial = partial_path_for(&target);
+        std::fs::rename(&target, &partial).unwrap();
+
         let wrong = "0000000000000000000000000000000000000000000000000000000000000000";
-        let err = verify_and_seal(&target, Some(wrong.to_string())).unwrap_err();
+        let err = verify_then_seal(&partial, &target, Some(wrong.to_string())).unwrap_err();
         let message = err.to_string();
         assert!(message.contains("does not match"), "got: {message}");
         assert!(
             !DigestSidecar::path_for(&target).exists(),
             "a mismatch must not leave a sidecar behind"
+        );
+        assert!(
+            !target.exists(),
+            "a mismatch must not leave the file under the model's own name"
         );
     }
 
@@ -715,8 +726,10 @@ mod tests {
         let target = dir.path().join("model.gguf");
         std::fs::write(&target, b"hello").unwrap();
         let good = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        let partial = partial_path_for(&target);
+        std::fs::rename(&target, &partial).unwrap();
 
-        verify_and_seal(&target, Some(good.to_string())).unwrap();
+        verify_then_seal(&partial, &target, Some(good.to_string())).unwrap();
 
         let sidecar = DigestSidecar::read_for(&target)
             .unwrap()
