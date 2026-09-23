@@ -34,15 +34,25 @@ current build ships:
   `query`) with the Qwen3-Reranker-0.6B Q8_0 cross-encoder and return them
   best-first; also available as an opt-in `--rerank` flag on `markq query`
   that reranks the fused results after fusion.
+- **Model management** (`markq models pull` / `markq models ls`): fetch the
+  embedder and reranker with resumable transfers, checked against the digest
+  the repository declares, and list what is cached, how big it is, and whether
+  anything vouches for it.
+- **Diagnosis** (`markq doctor`): one read-only command reporting dataset
+  presence, schema drift, embedder identity and dimension, index coverage as
+  row counts, and each model's state, giving every finding one action that
+  clears it. `--json` for scripts, `--verify` to hash every cached model.
+- **Offline operation** (`--offline`, `MARKQ_OFFLINE`, `MARKQ_MODELS_DIR`):
+  forbid network access outright, or point at a directory of pre-staged
+  models. With every model cached, no command makes a request.
 - **Query embedding** (`markq embed-query`) — print a query's embedding as
   a JSON array so external tools (DuckDB's `lance_vector_search`, pylance)
   can run their own vector search without loading a GGUF.
 
-The model-management UX (`doctor` / `models`), incremental reindex /
-`compact`, document fetch (`get` / `multi-get`), MCP server, and the
-multi-collection / context-tree UX are pending — their subcommands are
-registered in the `clap` surface and exit with a structured "not
-implemented yet" until their slice lands. See
+Index compaction (`compact`), document fetch (`get` / `multi-get`), the MCP
+server, and the multi-collection / context-tree UX are pending. Their
+subcommands are registered in the `clap` surface and exit with a structured
+"not implemented yet" until their slice lands. See
 [`usage/markq.md`](usage/markq.md) for the per-command status table.
 
 ## Layout
@@ -53,7 +63,8 @@ implemented yet" until their slice lands. See
 | `markq-index-lance`    | LanceDB-backed `Index` implementation                    |
 | `markq-cli`            | The `markq` binary (clap, tracing)                       |
 | `markq-chunker`        | Markdown chunker (heading splits, tree-sitter fenced-code protection, token budgeting) |
-| `markq-inference`      | `llama-cpp-2` embedder + Qwen3-Reranker cross-encoder, each on a single owner thread + bounded channel |
+| `markq-inference`      | `llama-cpp-2` embedder + Qwen3-Reranker cross-encoder, each on a single owner thread + bounded channel; model cache, resumable fetch, digest sidecars |
+| `markq-test-support`   | Test-only fixtures shared across crates (a local stand-in for the model hub) |
 
 `usage/` contains runnable docs with real captured output:
 [`markq.md`](usage/markq.md) (CLI surface), [`duckdb.md`](usage/duckdb.md) (SQL access), and
