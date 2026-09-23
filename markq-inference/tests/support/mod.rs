@@ -15,6 +15,10 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+/// The most recent content request's byte range, shared with the connection
+/// handlers so a test can read what was actually asked for.
+type RangeLog = Arc<Mutex<Option<(u64, Option<u64>)>>>;
+
 /// How the hub should behave for content requests, so a test can drive the
 /// failure paths without racing a real connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +39,7 @@ pub struct FakeHub {
     sha256: String,
     filename: String,
     requests: Arc<AtomicUsize>,
-    last_range: Arc<Mutex<Option<(u64, Option<u64>)>>>,
+    last_range: RangeLog,
 }
 
 impl FakeHub {
@@ -132,7 +136,7 @@ async fn serve(
     digest: String,
     filename: String,
     behavior: Behavior,
-    ranges: Arc<Mutex<Option<(u64, Option<u64>)>>>,
+    ranges: RangeLog,
 ) -> std::io::Result<()> {
     let request = read_request(&mut stream).await?;
     let (method, target) = request_line(&request);
