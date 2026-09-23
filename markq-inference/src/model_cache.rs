@@ -53,6 +53,82 @@ impl KnownModel {
     }
 }
 
+/// Where an in-flight transfer accumulates bytes. Kept beside the model file so
+/// the resume offset is simply this file's length.
+pub fn partial_path_for(model_path: &Path) -> PathBuf {
+    let mut name = model_path.as_os_str().to_os_string();
+    name.push(".partial");
+    PathBuf::from(name)
+}
+
+/// What the cache knows about one role's file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheState {
+    /// Neither the model file nor an unfinished transfer is present.
+    Absent,
+    /// An unfinished transfer is present; `bytes` is the resume offset.
+    Partial { bytes: u64 },
+    /// The file is here, but no sidecar vouches for it at its current size.
+    Unverified,
+    /// A sidecar records this file, and the file is still that size.
+    Verified,
+}
+
+/// One role's state on disk, and the row `markq models ls` prints.
+#[derive(Debug, Clone)]
+pub struct CacheEntry {
+    pub role: ModelRole,
+    pub path: PathBuf,
+    pub state: CacheState,
+    pub size_bytes: Option<u64>,
+    pub digest: Option<String>,
+    pub digest_source: Option<String>,
+}
+
+impl CacheEntry {
+    /// Read one role's state from `models_dir` without touching the network.
+    pub fn inspect(role: ModelRole, models_dir: &Path) -> Result<Self> {
+        let path = models_dir.join(role.known_model().filename());
+        let sidecar = DigestSidecar::read_for(&path)?;
+        let size_bytes = match std::fs::metadata(&path) {
+            Ok(metadata) => Some(metadata.len()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err).with_context(|| format!("stat {}", path.display())),
+        };
+
+        let state = match size_bytes {
+            Some(size) => match &sidecar {
+                Some(record) if record.size_bytes == size => CacheState::Verified,
+                _ => CacheState::Unverified,
+            },
+            None => match std::fs::metadata(partial_path_for(&path)) {
+                Ok(metadata) => CacheState::Partial {
+                    bytes: metadata.len(),
+                },
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => CacheState::Absent,
+                Err(err) => {
+                    return Err(err).with_context(|| format!("stat partial for {}", path.display()))
+                }
+            },
+        };
+
+        // A sidecar is only reported once it describes the file that is there.
+        let (digest, digest_source) = match (&state, sidecar) {
+            (CacheState::Verified, Some(record)) => (Some(record.digest), Some(record.source)),
+            _ => (None, None),
+        };
+
+        Ok(Self {
+            role,
+            path,
+            state,
+            size_bytes,
+            digest,
+            digest_source,
+        })
+    }
+}
+
 /// What a verified download records next to its model file, so a later run can
 /// re-check the file without asking the hub what "correct" means. It travels
 /// with the directory when an operator copies a staged cache.
@@ -285,6 +361,51 @@ mod tests {
             msg.contains(good),
             "error should report actual digest: {msg}"
         );
+    }
+
+    #[test]
+    fn cache_state_matches_files_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let role = ModelRole::Embedder;
+        let model = dir.path().join(role.known_model().filename());
+
+        let entry = CacheEntry::inspect(role, dir.path()).unwrap();
+        assert_eq!(entry.state, CacheState::Absent);
+        assert_eq!(entry.size_bytes, None);
+
+        let partial = partial_path_for(&model);
+        std::fs::write(&partial, b"0123456789").unwrap();
+        let entry = CacheEntry::inspect(role, dir.path()).unwrap();
+        assert_eq!(entry.state, CacheState::Partial { bytes: 10 });
+        std::fs::remove_file(&partial).unwrap();
+
+        std::fs::write(&model, b"hello").unwrap();
+        let entry = CacheEntry::inspect(role, dir.path()).unwrap();
+        assert_eq!(entry.state, CacheState::Unverified);
+        assert_eq!(entry.size_bytes, Some(5));
+
+        DigestSidecar {
+            digest: "abc".into(),
+            size_bytes: 5,
+            source: "hub lfs metadata".into(),
+        }
+        .write_for(&model)
+        .unwrap();
+        let entry = CacheEntry::inspect(role, dir.path()).unwrap();
+        assert_eq!(entry.state, CacheState::Verified);
+        assert_eq!(entry.digest.as_deref(), Some("abc"));
+        assert_eq!(entry.digest_source.as_deref(), Some("hub lfs metadata"));
+
+        // A sidecar that disagrees about the size does not vouch for this file.
+        DigestSidecar {
+            digest: "abc".into(),
+            size_bytes: 999,
+            source: "hub lfs metadata".into(),
+        }
+        .write_for(&model)
+        .unwrap();
+        let entry = CacheEntry::inspect(role, dir.path()).unwrap();
+        assert_eq!(entry.state, CacheState::Unverified);
     }
 
     #[test]
