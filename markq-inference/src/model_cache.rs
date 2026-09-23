@@ -1,8 +1,6 @@
-//! GGUF model resolution + cached download. Hugging Face is the source of
-//! record; `hf-hub` writes into `~/.cache/markq/models/<repo>/<file>` (or
-//! `$MARKQ_MODELS_DIR` when set). After a download we optionally verify a
-//! known SHA-256 against the file; this is best-effort in v1 — the full
-//! resumable / `markq models pull` UX lands later.
+//! GGUF model resolution and cached download. Hugging Face is the source of
+//! record, and files land flat in `~/.cache/markq/models/<filename>` (or
+//! `$MARKQ_MODELS_DIR` when set).
 
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -11,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use hf_hub::HFClient;
 use sha2::{Digest, Sha256};
-use tracing::{info, warn};
+use tracing::info;
 
 /// Curated set of GGUFs markq knows how to fetch. Each new model that's
 /// needed adds an entry. v1 ships the embedder and a cross-encoder reranker;
@@ -52,20 +50,54 @@ impl KnownModel {
             KnownModel::Qwen3Reranker06B => "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/Q8_0",
         }
     }
+}
 
-    /// Known-good SHA-256 hex digest, when one has been recorded. `None` means
-    /// "no pin yet"; the cache then logs a warning rather than failing the
-    /// download. A future `markq doctor` will surface unpinned models.
-    pub fn sha256(self) -> Option<&'static str> {
+/// The name a user types to refer to one of the models markq can fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelRole {
+    Embedder,
+    Reranker,
+}
+
+impl ModelRole {
+    /// Every role, in the order `markq models ls` presents them.
+    pub const ALL: [ModelRole; 2] = [ModelRole::Embedder, ModelRole::Reranker];
+
+    pub fn as_str(self) -> &'static str {
         match self {
-            // TODO: record the digest of the Qwen3-Embedding GGUF
-            // after the first known-good download; until then the verifier
-            // logs a warning and accepts whatever is on disk.
-            KnownModel::Qwen3Embedding06B => None,
-            // TODO: record the digest of the Qwen3-Reranker GGUF
-            // after the first known-good download; until then the verifier
-            // logs a warning and accepts whatever is on disk.
-            KnownModel::Qwen3Reranker06B => None,
+            ModelRole::Embedder => "embedder",
+            ModelRole::Reranker => "reranker",
+        }
+    }
+
+    pub fn known_model(self) -> KnownModel {
+        match self {
+            ModelRole::Embedder => KnownModel::Qwen3Embedding06B,
+            ModelRole::Reranker => KnownModel::Qwen3Reranker06B,
+        }
+    }
+
+    /// The role list an unknown-role error offers the user.
+    fn valid_list() -> String {
+        ModelRole::ALL
+            .iter()
+            .map(|role| role.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl std::str::FromStr for ModelRole {
+    type Err = markq_core::Error;
+
+    fn from_str(name: &str) -> std::result::Result<Self, Self::Err> {
+        match name {
+            "embedder" => Ok(ModelRole::Embedder),
+            "reranker" => Ok(ModelRole::Reranker),
+            other => Err(markq_core::Error::UnknownModelRole {
+                given: other.to_string(),
+                valid: ModelRole::valid_list(),
+            }),
         }
     }
 }
@@ -97,7 +129,6 @@ pub async fn ensure_model(model: KnownModel) -> Result<PathBuf> {
     let expected_path = local_dir.join(filename);
     if expected_path.exists() {
         info!(path = %expected_path.display(), "model already cached");
-        verify_sha256_if_known(&expected_path, model)?;
         return Ok(expected_path);
     }
 
@@ -118,28 +149,13 @@ pub async fn ensure_model(model: KnownModel) -> Result<PathBuf> {
         .await
         .with_context(|| format!("hf-hub download_file {owner}/{name}/{filename}"))?;
 
-    verify_sha256_if_known(&downloaded, model)?;
     Ok(downloaded)
 }
 
-/// Compute the SHA-256 of `path` and compare against `model.sha256()`. If the
-/// model has no recorded digest, log a warning and return Ok.
-fn verify_sha256_if_known(path: &Path, model: KnownModel) -> Result<()> {
-    let Some(expected) = model.sha256() else {
-        warn!(
-            id = model.id(),
-            path = %path.display(),
-            "no SHA-256 pin recorded for this model; skipping verification"
-        );
-        return Ok(());
-    };
-    verify_sha256_against(path, expected)
-}
-
-/// Verify `path`'s SHA-256 matches `expected` (hex, case-insensitive).
-/// Split out from `verify_sha256_if_known` so tests can drive the mismatch
-/// branch without needing a `KnownModel` with a pinned digest.
-fn verify_sha256_against(path: &Path, expected: &str) -> Result<()> {
+/// Verify `path`'s SHA-256 matches `expected` (hex, case-insensitive). Public
+/// alongside `sha256_hex` so callers outside this module can check a file they
+/// already have against a digest they obtained elsewhere.
+pub fn verify_sha256_against(path: &Path, expected: &str) -> Result<()> {
     let actual = sha256_hex(path)?;
     if !actual.eq_ignore_ascii_case(expected) {
         return Err(anyhow!(
@@ -209,6 +225,32 @@ mod tests {
             msg.contains(good),
             "error should report actual digest: {msg}"
         );
+    }
+
+    #[test]
+    fn unknown_role_error_lists_valid_roles() {
+        let err = "embeder".parse::<ModelRole>().unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("embeder"), "got: {message}");
+        assert!(message.contains("embedder"), "got: {message}");
+        assert!(message.contains("reranker"), "got: {message}");
+    }
+
+    #[test]
+    fn roles_round_trip_to_known_models() {
+        for role in ModelRole::ALL {
+            assert_eq!(role.as_str().parse::<ModelRole>().unwrap(), role);
+        }
+        assert_eq!(
+            ModelRole::Embedder.known_model().id(),
+            KnownModel::Qwen3Embedding06B.id()
+        );
+        assert_eq!(
+            ModelRole::Reranker.known_model().id(),
+            KnownModel::Qwen3Reranker06B.id()
+        );
+        assert_eq!(ModelRole::Embedder.as_str(), "embedder");
+        assert_eq!(ModelRole::Reranker.as_str(), "reranker");
     }
 
     #[test]
