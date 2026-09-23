@@ -22,6 +22,18 @@ const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (backend: cuda)");
 #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (backend: cpu)");
 
+/// Render a byte count the way a person reads a model file's size.
+fn human_size(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes / GIB)
+    } else {
+        format!("{:.0} MiB", bytes / MIB)
+    }
+}
+
 /// The environment variable that forbids network access.
 const OFFLINE_VARIABLE: &str = "MARKQ_OFFLINE";
 
@@ -493,17 +505,16 @@ async fn cmd_models(cmd: ModelsCmd, offline: Option<&str>) -> Result<()> {
                 serde_json::to_writer_pretty(std::io::stdout(), &rows)?;
                 println!();
             } else {
+                println!("{:<10} {:<11} {:>9}  MODEL", "ROLE", "STATE", "SIZE");
                 for row in &rows {
                     println!(
-                        "{:<10} {:<10} {:>14} {}  {}",
+                        "{:<10} {:<11} {:>9}  {}",
                         row.role,
                         row.state,
-                        row.size_bytes
-                            .map(|bytes| bytes.to_string())
-                            .unwrap_or_else(|| "-".to_string()),
-                        row.digest.as_deref().unwrap_or("-"),
-                        row.filename,
+                        row.size_bytes.map(human_size).unwrap_or_else(|| "-".into()),
+                        row.model_id,
                     );
+                    println!("{:<34}{}", "", row.filename);
                 }
             }
             Ok(())
@@ -520,12 +531,14 @@ async fn cmd_doctor(dataset_path: &std::path::Path, args: &DoctorArgs) -> Result
         println!();
     } else {
         for f in &findings {
-            println!("[{:<7}] {:<24} {}", f.severity, f.check, f.next_step);
+            let tag = format!("[{}]", f.severity);
+            let line = format!("{tag:<10} {:<24} {}", f.check, f.next_step);
+            println!("{}", line.trim_end());
             if let Some(observed) = &f.observed {
-                println!("          observed: {observed}");
+                println!("           observed: {observed}");
             }
             if let Some(expected) = &f.expected {
-                println!("          expected: {expected}");
+                println!("           expected: {expected}");
             }
         }
     }
