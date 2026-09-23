@@ -236,7 +236,7 @@ fn check_one_index(
         return Diagnostic::ok(check);
     }
     match health.indexes.iter().find(|c| c.column == column) {
-        None => Diagnostic::error(
+        None => Diagnostic::warning(
             check,
             "no index built",
             format!("{} row(s) indexed", health.row_count),
@@ -279,19 +279,11 @@ fn check_model(
     let model_path = models_dir.join(role.known_model().filename());
     let mut findings = Vec::new();
 
-    if DigestSidecar::is_stale_for(&model_path) {
-        findings.push(Diagnostic::warning(
-            &check,
-            "a digest record with no matching file (stale sidecar)",
-            "a verified file matching its digest record",
-            format!(
-                "run `markq models pull {}` to fetch it again",
-                role.as_str()
-            ),
-        ));
-    } else {
-        let entry = CacheEntry::inspect(role, models_dir)
-            .with_context(|| format!("inspect {} cache entry", role.as_str()))?;
+    let entry = CacheEntry::inspect(role, models_dir)
+        .with_context(|| format!("inspect {} cache entry", role.as_str()))?;
+    let sidecar = DigestSidecar::read_for(&model_path)?;
+
+    {
         let mut finding = match entry.state {
             CacheState::Absent => Diagnostic::error(
                 &check,
@@ -308,18 +300,34 @@ fn check_model(
                     role.as_str()
                 ),
             ),
-            CacheState::Unverified => Diagnostic::warning(
-                &check,
-                if verify {
-                    // Saying nothing here would let a full-verification run
-                    // look like it had examined a file it never hashed.
-                    "present but not verified, and there is no recorded digest to check it against"
-                } else {
-                    "present but not verified"
-                },
-                "a verified file",
-                format!("run `markq models pull {}` to verify it", role.as_str()),
-            ),
+            CacheState::Unverified => match &sidecar {
+                Some(record) => Diagnostic::error(
+                    &check,
+                    format!(
+                        "{} byte(s) on disk, but its digest record says {}",
+                        entry.size_bytes.unwrap_or_default(),
+                        record.size_bytes
+                    ),
+                    "a file matching its digest record",
+                    format!(
+                        "delete {} and run `markq models pull {}` to fetch it again",
+                        model_path.display(),
+                        role.as_str()
+                    ),
+                ),
+                None => Diagnostic::warning(
+                    &check,
+                    if verify {
+                        // Saying nothing here would let a full-verification run
+                        // look like it had examined a file it never hashed.
+                        "present but not verified, and there is no recorded digest to check it against"
+                    } else {
+                        "present but not verified"
+                    },
+                    "a verified file",
+                    format!("run `markq models pull {}` to verify it", role.as_str()),
+                ),
+            },
             CacheState::Verified => Diagnostic::ok(&check),
         };
 
@@ -334,7 +342,8 @@ fn check_model(
                         format!("full digest {actual} does not match its recorded digest"),
                         format!("digest {}", sidecar.digest),
                         format!(
-                            "run `markq models pull {}` to fetch it again",
+                            "delete {} and run `markq models pull {}` to fetch it again",
+                            model_path.display(),
                             role.as_str()
                         ),
                     );
@@ -343,6 +352,20 @@ fn check_model(
         }
 
         findings.push(finding);
+    }
+
+    // A record whose file is gone explains itself, but it must not soften the
+    // finding above: a missing model is still missing.
+    if DigestSidecar::is_stale_for(&model_path) {
+        findings.push(Diagnostic::warning(
+            format!("{check}.record"),
+            "a digest record with no matching file",
+            "a digest record describing a file that is there",
+            format!(
+                "run `markq models pull {}` to fetch the file its record describes",
+                role.as_str()
+            ),
+        ));
     }
 
     if model_cache::download_in_progress(&model_path)? {
@@ -435,14 +458,17 @@ mod tests {
             .iter()
             .find(|f| f.check == "index.lexical")
             .unwrap();
-        assert_eq!(lexical.severity, Severity::Error);
+        // Not an error: a corpus that has been indexed but never embedded is a
+        // supported state, and grading it an error fails the exit status a
+        // script gates on for an installation that works.
+        assert_eq!(lexical.severity, Severity::Warning);
         assert!(
             lexical.next_step.contains("markq index"),
             "got: {}",
             lexical.next_step
         );
         let vector = findings.iter().find(|f| f.check == "index.vector").unwrap();
-        assert_eq!(vector.severity, Severity::Error);
+        assert_eq!(vector.severity, Severity::Warning);
         assert!(
             vector.next_step.contains("markq embed"),
             "got: {}",
@@ -536,11 +562,82 @@ mod tests {
 
         let findings = check_model(ModelRole::Embedder, dir.path(), false).unwrap();
 
-        assert_eq!(findings.len(), 1);
-        assert_ne!(
-            findings[0].severity,
-            Severity::Ok,
-            "a stale sidecar with no matching file must not read as verified"
+        // The leftover record explains itself, but the model is still missing,
+        // and a stale record must not soften that into a warning a CI gate
+        // would pass.
+        let state = findings
+            .iter()
+            .find(|f| f.check == "models.embedder")
+            .expect("a finding about the model itself");
+        assert_eq!(state.severity, Severity::Error);
+        let record = findings
+            .iter()
+            .find(|f| f.check == "models.embedder.record")
+            .expect("a finding about the leftover record");
+        assert_eq!(record.severity, Severity::Warning);
+    }
+
+    #[test]
+    fn size_disagreeing_with_its_record_is_an_error_naming_the_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir
+            .path()
+            .join(ModelRole::Embedder.known_model().filename());
+        std::fs::write(&model_path, b"truncated").unwrap();
+        DigestSidecar {
+            digest: "abc".into(),
+            size_bytes: 4096,
+            source: "hub lfs metadata".into(),
+        }
+        .write_for(&model_path)
+        .unwrap();
+
+        let findings = check_model(ModelRole::Embedder, dir.path(), false).unwrap();
+        let finding = findings
+            .iter()
+            .find(|f| f.check == "models.embedder")
+            .unwrap();
+
+        // The next load refuses this file outright, so predicting that is the
+        // whole point of the diagnosis.
+        assert_eq!(finding.severity, Severity::Error);
+        // `models pull` skips a file it considers cached, so the advice has to
+        // get the file out of the way first.
+        assert!(
+            finding.next_step.contains("delete"),
+            "got: {}",
+            finding.next_step
+        );
+    }
+
+    #[test]
+    fn verified_digest_mismatch_says_to_delete_before_pulling() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir
+            .path()
+            .join(ModelRole::Embedder.known_model().filename());
+        std::fs::write(&model_path, b"hello").unwrap();
+        DigestSidecar {
+            digest: "0000000000000000000000000000000000000000000000000000000000000000".into(),
+            size_bytes: 5,
+            source: "hub lfs metadata".into(),
+        }
+        .write_for(&model_path)
+        .unwrap();
+
+        let findings = check_model(ModelRole::Embedder, dir.path(), true).unwrap();
+        let finding = findings
+            .iter()
+            .find(|f| f.check == "models.embedder")
+            .unwrap();
+
+        assert_eq!(finding.severity, Severity::Error);
+        // Pulling alone is a no-op here: the file still passes the size check
+        // that `models pull` uses to decide a role is already done.
+        assert!(
+            finding.next_step.contains("delete"),
+            "got: {}",
+            finding.next_step
         );
     }
 
