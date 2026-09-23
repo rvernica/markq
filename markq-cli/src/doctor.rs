@@ -6,7 +6,9 @@ use std::cmp::Ordering;
 use std::path::Path;
 
 use anyhow::Context;
-use markq_core::{DatasetMetadata, Index, EMBEDDING_DIM_DEFAULT, SCHEMA_VERSION};
+use markq_core::{
+    ChunkColumn, DatasetMetadata, Index, IndexHealth, EMBEDDING_DIM_DEFAULT, SCHEMA_VERSION,
+};
 use markq_index_lance::LanceIndex;
 use markq_inference::model_cache::ModelRole;
 use serde::Serialize;
@@ -132,6 +134,8 @@ pub async fn check_dataset(dataset_path: &Path) -> anyhow::Result<Vec<Diagnostic
     let metadata = idx.metadata().await.context("read dataset metadata")?;
     findings.push(check_schema_version(metadata.schema_version));
     findings.push(check_embedder(&metadata));
+    let health = idx.health().await.context("read index health")?;
+    findings.extend(check_indexes(&health));
     Ok(findings)
 }
 
@@ -190,10 +194,55 @@ fn check_embedder(metadata: &DatasetMetadata) -> Diagnostic {
     Diagnostic::ok("dataset.embedder")
 }
 
+/// The lexical and vector index findings (FR-018a): coverage is reported as
+/// indexed/unindexed row counts against the current row count, never a
+/// present/absent boolean, so a partially rebuilt index is distinguishable
+/// from a fully missing one.
+fn check_indexes(health: &IndexHealth) -> Vec<Diagnostic> {
+    vec![
+        check_one_index(health, ChunkColumn::TEXT, "index.lexical", "markq index"),
+        check_one_index(
+            health,
+            ChunkColumn::EMBEDDING,
+            "index.vector",
+            "markq embed",
+        ),
+    ]
+}
+
+fn check_one_index(
+    health: &IndexHealth,
+    column: &str,
+    check: &str,
+    rebuild_command: &str,
+) -> Diagnostic {
+    if health.row_count == 0 {
+        return Diagnostic::ok(check);
+    }
+    match health.indexes.iter().find(|c| c.column == column) {
+        None => Diagnostic::error(
+            check,
+            "no index built",
+            format!("{} row(s) indexed", health.row_count),
+            format!("run `{rebuild_command}` to build the index"),
+        ),
+        Some(coverage) if coverage.unindexed_rows > 0 => Diagnostic::warning(
+            check,
+            format!(
+                "{} of {} row(s) indexed",
+                coverage.indexed_rows, health.row_count
+            ),
+            format!("{} row(s) indexed", health.row_count),
+            format!("run `{rebuild_command}` to cover the remaining rows"),
+        ),
+        Some(_) => Diagnostic::ok(check),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use markq_core::{DatasetMetadata, SCHEMA_VERSION};
+    use markq_core::{DatasetMetadata, IndexCoverage, SCHEMA_VERSION};
 
     #[tokio::test]
     async fn uninitialized_dataset_is_not_an_error() {
@@ -255,6 +304,67 @@ mod tests {
         assert_eq!(d.severity, Severity::Error);
         assert!(d.observed.as_deref().unwrap().contains('4'));
         assert!(d.expected.as_deref().unwrap().contains("1024"));
+    }
+
+    #[test]
+    fn missing_index_names_the_rebuild_command() {
+        let health = IndexHealth {
+            row_count: 4,
+            indexes: vec![],
+        };
+        let findings = check_indexes(&health);
+        let lexical = findings
+            .iter()
+            .find(|f| f.check == "index.lexical")
+            .unwrap();
+        assert_eq!(lexical.severity, Severity::Error);
+        assert!(
+            lexical.next_step.contains("markq index"),
+            "got: {}",
+            lexical.next_step
+        );
+        let vector = findings.iter().find(|f| f.check == "index.vector").unwrap();
+        assert_eq!(vector.severity, Severity::Error);
+        assert!(
+            vector.next_step.contains("markq embed"),
+            "got: {}",
+            vector.next_step
+        );
+    }
+
+    #[test]
+    fn partial_coverage_reports_counts_not_a_boolean() {
+        let health = IndexHealth {
+            row_count: 10,
+            indexes: vec![IndexCoverage {
+                column: ChunkColumn::EMBEDDING.to_string(),
+                indexed_rows: 6,
+                unindexed_rows: 4,
+            }],
+        };
+        let findings = check_indexes(&health);
+        let vector = findings.iter().find(|f| f.check == "index.vector").unwrap();
+        assert_eq!(vector.severity, Severity::Warning);
+        let observed = vector.observed.as_deref().unwrap();
+        assert!(observed.contains('6'), "got: {observed}");
+        assert!(observed.contains("10"), "got: {observed}");
+    }
+
+    #[test]
+    fn empty_dataset_reports_zero_rows_cleanly() {
+        let health = IndexHealth {
+            row_count: 0,
+            indexes: vec![],
+        };
+        let findings = check_indexes(&health);
+        for finding in &findings {
+            assert_eq!(
+                finding.severity,
+                Severity::Ok,
+                "check {} should be ok on an empty dataset",
+                finding.check
+            );
+        }
     }
 
     #[test]
