@@ -103,8 +103,8 @@ pub async fn download_model(
     let partial = partial_path_for(&target);
 
     // Hold this model's lock for the rest of the function, so a second
-    // caller fails immediately instead of racing this transfer (FR-010a,
-    // FR-010b). The lock releases when `lock` drops at function return.
+    // caller fails immediately instead of racing this transfer. The lock
+    // releases when `lock` drops at function return.
     let lock_path = lock_path_for(&target);
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -206,9 +206,9 @@ pub async fn download_model(
 /// would be indistinguishable from a file an operator staged, and the per-load
 /// check passes those through unexamined.
 ///
-/// A sidecar is written only once the hash matches (FR-008a). A repository that
+/// A sidecar is written only once the hash matches. A repository that
 /// declares no digest leaves the file unverified with no error, since there is
-/// nothing to check it against (FR-011a).
+/// nothing to check it against.
 fn verify_then_seal(partial: &Path, target: &Path, declared: Option<String>) -> Result<()> {
     if let Some(expected) = &declared {
         let found = sha256_hex(partial)?;
@@ -275,7 +275,7 @@ pub fn partial_path_for(model_path: &Path) -> PathBuf {
 }
 
 /// The advisory lock scoped to one model's download, so a download of one
-/// model never blocks a download of another (FR-010a).
+/// model never blocks a download of another.
 pub fn lock_path_for(model_path: &Path) -> PathBuf {
     let mut name = model_path.as_os_str().to_os_string();
     name.push(".lock");
@@ -283,7 +283,7 @@ pub fn lock_path_for(model_path: &Path) -> PathBuf {
 }
 
 /// Whether another process currently holds `model_path`'s download lock. A
-/// lock file that exists but that nobody holds is not a problem (FR-010c) —
+/// lock file that exists but that nobody holds is not a problem —
 /// this probes the lock itself rather than trusting the file's mere presence,
 /// so a lock file left behind by a process that exited normally is never
 /// mistaken for a download in progress.
@@ -543,10 +543,10 @@ pub fn models_dir() -> markq_core::Result<PathBuf> {
     resolve_models_dir(std::env::var("MARKQ_MODELS_DIR").ok().as_deref())
 }
 
-/// Refuse to load a cached file whose size disagrees with its sidecar
-/// (FR-006a). This is a size comparison only, run on every load, never a
+/// Refuse to load a cached file whose size disagrees with its sidecar.
+/// This is a size comparison only, run on every load, never a
 /// hash: hashing the cache on every load would make loading as slow as a
-/// fresh verification. A file with no sidecar (a pre-staged file, FR-011a)
+/// fresh verification. A file with no sidecar (a pre-staged file)
 /// passes through unchecked, since there is nothing recorded to compare
 /// against.
 fn check_cached_size(path: &Path) -> Result<()> {
@@ -935,7 +935,7 @@ mod tests {
 
         // A digest that could never match this file's real hash. If the
         // load path hashed the file and compared it, this would fail; it
-        // passes because the load path checks size only (FR-006a).
+        // passes because the load path checks size only.
         DigestSidecar {
             digest: "not-a-real-sha256".into(),
             size_bytes: 5,

@@ -33,9 +33,9 @@ impl std::fmt::Display for Severity {
 }
 
 /// One finding from `markq doctor`. `next_step` is required to be non-empty
-/// whenever `severity` is not `Ok` (FR-019); an `Ok` finding may still carry
-/// one (e.g. "not yet initialized, run `markq index`" is `Ok`, not an error,
-/// per FR-023).
+/// whenever `severity` is not `Ok`; an `Ok` finding may still carry
+/// one: "not yet initialized, run `markq index`" is `Ok` rather than an
+/// error, and still says what to do.
 #[derive(Debug, Clone, Serialize)]
 pub struct Diagnostic {
     pub check: String,
@@ -99,16 +99,16 @@ impl Diagnostic {
 }
 
 /// Whether the process should exit with a failure status: true when any
-/// finding is `Severity::Error` (FR-021). Warnings alone do not fail.
+/// finding is `Severity::Error`. Warnings alone do not fail.
 pub fn any_error(findings: &[Diagnostic]) -> bool {
     findings.iter().any(|f| f.severity == Severity::Error)
 }
 
 /// The complete `markq doctor` pass: dataset checks (presence, schema
 /// version, embedder identity, index coverage) followed by every known
-/// role's model-cache check. Read-only throughout (FR-025) and never loads a
-/// model (FR-020); works whether or not the dataset has ever been created
-/// (FR-023) and requires no network access (FR-022), since every check reads
+/// role's model-cache check. Read-only throughout and never loads a
+/// model; works whether or not the dataset has ever been created
+/// and requires no network access, since every check reads
 /// only local state.
 pub async fn run_doctor(
     dataset_path: &Path,
@@ -120,8 +120,8 @@ pub async fn run_doctor(
     Ok(findings)
 }
 
-/// Dataset presence, schema version, and embedder identity (FR-018, FR-023).
-/// Never creates a dataset (FR-025): a path that does not exist is reported
+/// Dataset presence, schema version, and embedder identity.
+/// Never creates a dataset: a path that does not exist is reported
 /// as uninitialized rather than opened via a creating call.
 pub async fn check_dataset(dataset_path: &Path) -> anyhow::Result<Vec<Diagnostic>> {
     if !dataset_path.exists() {
@@ -210,7 +210,7 @@ fn check_embedder(metadata: &DatasetMetadata) -> Diagnostic {
     Diagnostic::ok("dataset.embedder")
 }
 
-/// The lexical and vector index findings (FR-018a): coverage is reported as
+/// The lexical and vector index findings: coverage is reported as
 /// indexed/unindexed row counts against the current row count, never a
 /// present/absent boolean, so a partially rebuilt index is distinguishable
 /// from a fully missing one.
@@ -255,9 +255,9 @@ fn check_one_index(
     }
 }
 
-/// Every known role's model-cache finding (FR-018). `verify` additionally
-/// hashes each cached file's full content (FR-024); without it, an already
-/// cached role is checked by size only (FR-006a).
+/// Every known role's model-cache finding. `verify` additionally
+/// hashes each cached file's full content; without it, an already
+/// cached role is checked by size only.
 pub fn check_models(models_dir: &Path, verify: bool) -> anyhow::Result<Vec<Diagnostic>> {
     let mut findings = Vec::new();
     for role in ModelRole::ALL {
@@ -267,7 +267,7 @@ pub fn check_models(models_dir: &Path, verify: bool) -> anyhow::Result<Vec<Diagn
 }
 
 /// One role's model-cache finding: presence/completeness/verification, plus
-/// a separate finding when its download lock is currently held (FR-020: this
+/// a separate finding when its download lock is currently held (this
 /// never loads the model; `CacheEntry::inspect` only stats files, and hashing
 /// under `verify` reads file bytes, never loads them as a model).
 fn check_model(
@@ -324,7 +324,7 @@ fn check_model(
         };
 
         // The size-only check above can't see a same-length alteration; a
-        // full hash catches it, but only when explicitly requested (FR-024).
+        // full hash catches it, but only when explicitly requested.
         if verify && entry.state == CacheState::Verified {
             if let Some(sidecar) = DigestSidecar::read_for(&model_path)? {
                 let actual = markq_inference::sha256_hex(&model_path)?;
@@ -673,7 +673,7 @@ mod tests {
 
         // A digest mismatch that only a hash would catch still reads as
         // verified without --verify, proving the default path checks size
-        // only, matching FR-006a / FR-024.
+        // only.
         let findings = check_model(ModelRole::Embedder, dir.path(), false).unwrap();
         assert_eq!(findings[0].severity, Severity::Ok);
     }

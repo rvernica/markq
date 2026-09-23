@@ -1,6 +1,6 @@
 //! `markq doctor` end to end: structured JSON output, the no-network and
-//! no-weights guarantees (FR-020, FR-022), read-only behavior (FR-025), and
-//! roadmap-language-free messages (FR-027).
+//! no-weights guarantees, read-only behavior, and
+//! roadmap-language-free messages.
 
 use markq_cli::doctor::run_doctor;
 
@@ -48,7 +48,7 @@ async fn doctor_json_emits_check_severity_observed_expected_next_step() {
     }
 }
 
-/// Doctor must never load model weights (FR-020), which is exactly what may
+/// Doctor must never load model weights, which is exactly what may
 /// be broken on the machine it's diagnosing. Both the embedder and reranker
 /// loaders route through `markq_inference::backend::shared()`, which logs
 /// "LlamaBackend initialized" the first time (and only the first time) the

@@ -23,8 +23,8 @@ impl PullOutcome {
     }
 }
 
-/// Make every requested role ready: an already-verified role is a no-op
-/// (FR-010); everything else is fetched and verified via `download_model`.
+/// Make every requested role ready: an already-verified role is a no-op,
+/// and everything else is fetched and verified via `download_model`.
 /// `role_name` selects one role; `None` processes every known role.
 pub async fn run_pull(
     role_name: Option<&str>,
@@ -61,7 +61,7 @@ pub async fn run_pull(
 
 /// The roles `pull`/`ls` should process: the one the user named, or every
 /// known role when none was given. An unknown name surfaces the same
-/// `UnknownModelRole` error `ModelRole::from_str` produces (FR-003).
+/// `UnknownModelRole` error `ModelRole::from_str` produces.
 fn resolve_roles(role_name: Option<&str>) -> Result<Vec<ModelRole>> {
     match role_name {
         Some(name) => Ok(vec![name.parse::<ModelRole>()?]),
@@ -69,7 +69,7 @@ fn resolve_roles(role_name: Option<&str>) -> Result<Vec<ModelRole>> {
     }
 }
 
-/// One role's row in `markq models ls`: exactly the fields FR-004 requires,
+/// One role's row in `markq models ls`: exactly the fields the listing documents,
 /// present or not.
 #[derive(Debug, Serialize)]
 pub struct ModelRow {
@@ -103,7 +103,7 @@ impl ModelRow {
     }
 }
 
-/// One row per known role, whether or not it is cached (FR-004).
+/// One row per known role, whether or not it is cached.
 pub fn ls_rows(models_dir: &Path) -> Result<Vec<ModelRow>> {
     ModelRole::ALL
         .into_iter()

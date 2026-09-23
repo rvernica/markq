@@ -121,7 +121,7 @@ pub trait Index: Send + Sync {
     async fn compact(&self) -> Result<()>;
 
     /// Report row count and per-column index coverage, without scanning row
-    /// contents (FR-018b, `markq doctor`'s read-only budget). Reads index
-    /// counts and presence only.
+    /// contents, which is what keeps the diagnosis inside its read-only
+    /// budget. Reads index counts and presence only.
     async fn health(&self) -> Result<IndexHealth>;
 }
