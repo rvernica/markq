@@ -1,15 +1,18 @@
-//! GGUF model resolution + cached download. Hugging Face is the source of
-//! record; `hf-hub` writes into `~/.cache/markq/models/<repo>/<file>` (or
-//! `$MARKQ_MODELS_DIR` when set). After a download we optionally verify a
-//! known SHA-256 against the file; this is best-effort in v1 — the full
-//! resumable / `markq models pull` UX lands later.
+//! GGUF model resolution and cached download. Hugging Face is the source of
+//! record, and files land flat in `~/.cache/markq/models/<filename>` (or
+//! `$MARKQ_MODELS_DIR` when set).
 
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
+use fs4::FileExt;
+use futures::StreamExt;
+use hf_hub::repository::files::RepoTreeEntry;
 use hf_hub::HFClient;
+use once_cell::sync::OnceCell;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
@@ -52,20 +55,461 @@ impl KnownModel {
             KnownModel::Qwen3Reranker06B => "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/Q8_0",
         }
     }
+}
 
-    /// Known-good SHA-256 hex digest, when one has been recorded. `None` means
-    /// "no pin yet"; the cache then logs a warning rather than failing the
-    /// download. A future `markq doctor` will surface unpinned models.
-    pub fn sha256(self) -> Option<&'static str> {
+/// Fetch `model` into `models_dir`, continuing an unfinished transfer rather
+/// than starting over.
+///
+/// Bytes accumulate in a partial file beside the target and are renamed into
+/// place only once the transfer is the size the repository declared, so a
+/// reader never observes a short file under the model's own name.
+pub async fn download_model(
+    client: &HFClient,
+    model: KnownModel,
+    models_dir: &Path,
+    offline: Option<&str>,
+) -> Result<PathBuf> {
+    let role = role_for(model);
+    let target = models_dir.join(model.filename());
+
+    // A cache that is already verified needs nothing from the network, which is
+    // what makes "no request when every model is present" hold for every
+    // caller rather than only the ones that remember to check.
+    if CacheEntry::inspect(role, models_dir)?.state == CacheState::Verified {
+        return Ok(target);
+    }
+
+    if let Some(setting) = offline {
+        // A file that is present but unverified is a different problem from one
+        // that was never fetched, and sending the user after a download they
+        // already have would waste their time.
+        let role_name = role.as_str().to_string();
+        let setting = setting.to_string();
+        return Err(if target.exists() {
+            markq_core::Error::OfflineVerificationRefused {
+                role: role_name,
+                setting,
+            }
+        } else {
+            markq_core::Error::OfflineRefused {
+                role: role_name,
+                setting,
+            }
+        }
+        .into());
+    }
+
+    std::fs::create_dir_all(models_dir)
+        .with_context(|| format!("create models dir {}", models_dir.display()))?;
+    let partial = partial_path_for(&target);
+
+    // Hold this model's lock for the rest of the function, so a second
+    // caller fails immediately instead of racing this transfer. The lock
+    // releases when `lock` drops at function return.
+    let lock_path = lock_path_for(&target);
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("open lock {}", lock_path.display()))?;
+    if let Err(err) = lock.try_lock_exclusive() {
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            return Err(markq_core::Error::ModelDownloadInProgress {
+                role: role_for(model).as_str().to_string(),
+                path: lock_path,
+            }
+            .into());
+        }
+        return Err(err).with_context(|| format!("lock {}", lock_path.display()));
+    }
+
+    let (owner, name) = model.repo();
+    let repo = client.model(owner, name);
+    let metadata = repo
+        .get_file_metadata()
+        .filepath(model.filename())
+        .send()
+        .await
+        .with_context(|| format!("read metadata for {owner}/{name}/{}", model.filename()))?;
+    let total = metadata.file_size;
+
+    let mut have = match std::fs::metadata(&partial) {
+        Ok(found) => found.len(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(err) => return Err(err).with_context(|| format!("stat {}", partial.display())),
+    };
+
+    // A partial that already meets or exceeds the declared size cannot be a
+    // prefix of the file being fetched, so it is discarded rather than resumed.
+    if have >= total {
+        if have > 0 {
+            warn!(
+                path = %partial.display(),
+                have,
+                total,
+                "discarding an unfinished transfer that is not a prefix of the declared file"
+            );
+            std::fs::remove_file(&partial)
+                .with_context(|| format!("remove {}", partial.display()))?;
+        }
+        have = 0;
+    }
+
+    let range = if have > 0 { Some(have..total) } else { None };
+    let (content_length, mut stream) = repo
+        .download_file_stream()
+        .filename(model.filename())
+        .maybe_range(range)
+        .send()
+        .await
+        .with_context(|| format!("fetch {owner}/{name}/{}", model.filename()))?;
+
+    // A server that does not implement ranges answers with the whole file.
+    // Appending that to what is already on disk would build a file longer than
+    // the original, so the transfer starts over instead.
+    let honored_range =
+        have == 0 || content_length.is_some_and(|length| length == total.saturating_sub(have));
+    if !honored_range {
+        warn!(
+            path = %partial.display(),
+            have,
+            total,
+            "the repository ignored the resume request, so the transfer restarts"
+        );
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true);
+    if honored_range && have > 0 {
+        options.append(true);
+    } else {
+        options.truncate(true);
+    }
+    let mut sink = options
+        .open(&partial)
+        .with_context(|| format!("open {}", partial.display()))?;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.with_context(|| format!("read body for {}", model.filename()))?;
+        sink.write_all(&chunk)
+            .with_context(|| format!("write {}", partial.display()))?;
+    }
+    sink.flush()
+        .with_context(|| format!("flush {}", partial.display()))?;
+    drop(sink);
+
+    let written = std::fs::metadata(&partial)
+        .with_context(|| format!("stat {}", partial.display()))?
+        .len();
+    if written != total {
+        return Err(markq_core::Error::ModelFileIncomplete {
+            path: partial,
+            have: written,
+            expected: total,
+        }
+        .into());
+    }
+
+    let declared = declared_digest(client, model)
+        .await
+        .with_context(|| format!("read declared digest for {}", model.filename()))?;
+    verify_then_seal(&partial, &target, declared)?;
+
+    Ok(target)
+}
+
+/// Hash a just-completed download and compare it against the digest the hub
+/// declared for it, recording the result as a sidecar on a match.
+///
+/// The check runs on the partial file, before the rename, so a file that fails
+/// it never appears under the model's own name. A failure that left it there
+/// would be indistinguishable from a file an operator staged, and the per-load
+/// check passes those through unexamined.
+///
+/// A sidecar is written only once the hash matches. A repository that
+/// declares no digest leaves the file unverified with no error, since there is
+/// nothing to check it against.
+fn verify_then_seal(partial: &Path, target: &Path, declared: Option<String>) -> Result<()> {
+    if let Some(expected) = &declared {
+        let found = sha256_hex(partial)?;
+        if !found.eq_ignore_ascii_case(expected) {
+            return Err(markq_core::Error::ModelDigestMismatch {
+                path: partial.to_path_buf(),
+                expected: expected.clone(),
+                found,
+            }
+            .into());
+        }
+    }
+
+    std::fs::rename(partial, target)
+        .with_context(|| format!("rename into {}", target.display()))?;
+
+    let Some(digest) = declared else {
+        return Ok(());
+    };
+    let size_bytes = std::fs::metadata(target)
+        .with_context(|| format!("stat {}", target.display()))?
+        .len();
+    DigestSidecar {
+        digest,
+        size_bytes,
+        source: "hub lfs metadata".to_string(),
+    }
+    .write_for(target)
+}
+
+/// The digest the repository declares for this model's file, when it declares
+/// one. This is what a download is checked against; a repository that declares
+/// nothing leaves the file unverifiable rather than untrusted.
+pub async fn declared_digest(client: &HFClient, model: KnownModel) -> Result<Option<String>> {
+    let (owner, name) = model.repo();
+    let repo = client.model(owner, name);
+    let wanted = model.filename();
+
+    let entries = repo
+        .list_tree()
+        .expand(true)
+        .send()
+        .with_context(|| format!("list {owner}/{name}"))?;
+    let mut entries = Box::pin(entries);
+
+    while let Some(entry) = entries.next().await {
+        let entry = entry.with_context(|| format!("read tree entry from {owner}/{name}"))?;
+        if let RepoTreeEntry::File { path, lfs, .. } = entry {
+            if path == wanted {
+                return Ok(lfs.and_then(|info| info.sha256));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Where an in-flight transfer accumulates bytes. Kept beside the model file so
+/// the resume offset is simply this file's length.
+pub fn partial_path_for(model_path: &Path) -> PathBuf {
+    let mut name = model_path.as_os_str().to_os_string();
+    name.push(".partial");
+    PathBuf::from(name)
+}
+
+/// The advisory lock scoped to one model's download, so a download of one
+/// model never blocks a download of another.
+pub fn lock_path_for(model_path: &Path) -> PathBuf {
+    let mut name = model_path.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Whether another process currently holds `model_path`'s download lock. A
+/// lock file that exists but that nobody holds is not a problem —
+/// this probes the lock itself rather than trusting the file's mere presence,
+/// so a lock file left behind by a process that exited normally is never
+/// mistaken for a download in progress.
+pub fn download_in_progress(model_path: &Path) -> Result<bool> {
+    let lock_path = lock_path_for(model_path);
+    if !lock_path.exists() {
+        return Ok(false);
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("open lock {}", lock_path.display()))?;
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            file.unlock()
+                .with_context(|| format!("unlock {}", lock_path.display()))?;
+            Ok(false)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+        Err(err) => Err(err).with_context(|| format!("probe lock {}", lock_path.display())),
+    }
+}
+
+/// The role that fetches `model`, for naming it in a contended-lock error.
+/// Every `KnownModel` variant has exactly one corresponding role.
+fn role_for(model: KnownModel) -> ModelRole {
+    ModelRole::ALL
+        .into_iter()
+        .find(|role| role.known_model().filename() == model.filename())
+        .expect("every KnownModel has a corresponding ModelRole")
+}
+
+/// What the cache knows about one role's file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheState {
+    /// Neither the model file nor an unfinished transfer is present.
+    Absent,
+    /// An unfinished transfer is present; `bytes` is the resume offset.
+    Partial { bytes: u64 },
+    /// The file is here, but no sidecar vouches for it at its current size.
+    Unverified,
+    /// A sidecar records this file, and the file is still that size.
+    Verified,
+}
+
+/// One role's state on disk, and the row `markq models ls` prints.
+#[derive(Debug, Clone)]
+pub struct CacheEntry {
+    pub role: ModelRole,
+    pub path: PathBuf,
+    pub state: CacheState,
+    pub size_bytes: Option<u64>,
+    pub digest: Option<String>,
+    pub digest_source: Option<String>,
+}
+
+impl CacheEntry {
+    /// Read one role's state from `models_dir` without touching the network.
+    pub fn inspect(role: ModelRole, models_dir: &Path) -> Result<Self> {
+        let path = models_dir.join(role.known_model().filename());
+        let sidecar = DigestSidecar::read_for(&path)?;
+        let size_bytes = match std::fs::metadata(&path) {
+            Ok(metadata) => Some(metadata.len()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err).with_context(|| format!("stat {}", path.display())),
+        };
+
+        let state = match size_bytes {
+            Some(size) => match &sidecar {
+                Some(record) if record.size_bytes == size => CacheState::Verified,
+                _ => CacheState::Unverified,
+            },
+            None => match std::fs::metadata(partial_path_for(&path)) {
+                Ok(metadata) => CacheState::Partial {
+                    bytes: metadata.len(),
+                },
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => CacheState::Absent,
+                Err(err) => {
+                    return Err(err).with_context(|| format!("stat partial for {}", path.display()))
+                }
+            },
+        };
+
+        // A sidecar is only reported once it describes the file that is there.
+        let (digest, digest_source) = match (&state, sidecar) {
+            (CacheState::Verified, Some(record)) => (Some(record.digest), Some(record.source)),
+            _ => (None, None),
+        };
+
+        Ok(Self {
+            role,
+            path,
+            state,
+            size_bytes,
+            digest,
+            digest_source,
+        })
+    }
+}
+
+/// What a verified download records next to its model file, so a later run can
+/// re-check the file without asking the hub what "correct" means. It travels
+/// with the directory when an operator copies a staged cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DigestSidecar {
+    /// Lowercase hex SHA-256 of the verified file.
+    pub digest: String,
+    /// Size of the verified file, which is what the per-load check compares.
+    pub size_bytes: u64,
+    /// Where the digest came from, so a later disagreement is attributable.
+    pub source: String,
+}
+
+impl DigestSidecar {
+    /// The sidecar path for a model file.
+    pub fn path_for(model_path: &Path) -> PathBuf {
+        let mut name = model_path.as_os_str().to_os_string();
+        name.push(".digest.json");
+        PathBuf::from(name)
+    }
+
+    /// Read the sidecar beside `model_path`, if one is there. A sidecar that
+    /// cannot be parsed is an error rather than a silent absence: it means
+    /// something wrote the file, and treating that as "no record" would hide
+    /// the problem behind a re-download.
+    pub fn read_for(model_path: &Path) -> Result<Option<Self>> {
+        let path = Self::path_for(model_path);
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => {
+                let sidecar = serde_json::from_str(&raw)
+                    .with_context(|| format!("parse digest sidecar {}", path.display()))?;
+                Ok(Some(sidecar))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
+        }
+    }
+
+    /// Write the sidecar beside `model_path` by rename, so a reader never sees
+    /// a half-written record.
+    pub fn write_for(&self, model_path: &Path) -> Result<()> {
+        let path = Self::path_for(model_path);
+        let mut temporary = path.clone();
+        temporary.set_extension("tmp");
+        let encoded = serde_json::to_vec_pretty(self).context("encode digest sidecar")?;
+        std::fs::write(&temporary, encoded)
+            .with_context(|| format!("write {}", temporary.display()))?;
+        std::fs::rename(&temporary, &path)
+            .with_context(|| format!("rename into {}", path.display()))?;
+        Ok(())
+    }
+
+    /// A sidecar whose model file is gone describes nothing, and must not let a
+    /// later download skip its own verification.
+    pub fn is_stale_for(model_path: &Path) -> bool {
+        Self::path_for(model_path).exists() && !model_path.exists()
+    }
+}
+
+/// The name a user types to refer to one of the models markq can fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelRole {
+    Embedder,
+    Reranker,
+}
+
+impl ModelRole {
+    /// Every role, in the order `markq models ls` presents them.
+    pub const ALL: [ModelRole; 2] = [ModelRole::Embedder, ModelRole::Reranker];
+
+    pub fn as_str(self) -> &'static str {
         match self {
-            // TODO: record the digest of the Qwen3-Embedding GGUF
-            // after the first known-good download; until then the verifier
-            // logs a warning and accepts whatever is on disk.
-            KnownModel::Qwen3Embedding06B => None,
-            // TODO: record the digest of the Qwen3-Reranker GGUF
-            // after the first known-good download; until then the verifier
-            // logs a warning and accepts whatever is on disk.
-            KnownModel::Qwen3Reranker06B => None,
+            ModelRole::Embedder => "embedder",
+            ModelRole::Reranker => "reranker",
+        }
+    }
+
+    pub fn known_model(self) -> KnownModel {
+        match self {
+            ModelRole::Embedder => KnownModel::Qwen3Embedding06B,
+            ModelRole::Reranker => KnownModel::Qwen3Reranker06B,
+        }
+    }
+
+    /// The role list an unknown-role error offers the user.
+    fn valid_list() -> String {
+        ModelRole::ALL
+            .iter()
+            .map(|role| role.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl std::str::FromStr for ModelRole {
+    type Err = markq_core::Error;
+
+    fn from_str(name: &str) -> std::result::Result<Self, Self::Err> {
+        match name {
+            "embedder" => Ok(ModelRole::Embedder),
+            "reranker" => Ok(ModelRole::Reranker),
+            other => Err(markq_core::Error::UnknownModelRole {
+                given: other.to_string(),
+                valid: ModelRole::valid_list(),
+            }),
         }
     }
 }
@@ -74,72 +518,141 @@ impl KnownModel {
 /// then falls back to `$XDG_CACHE_HOME/markq/models`, then `~/.cache/markq/
 /// models`, then `./markq/models` if no cache dir can be resolved (containers,
 /// CI without `$HOME`).
-pub fn models_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("MARKQ_MODELS_DIR") {
-        return PathBuf::from(p);
+/// Resolve the models directory, validating an override the user supplied.
+///
+/// An override has to already be there. Pointing at a staged directory that is
+/// missing or unreadable is a typo or a permissions problem, and silently
+/// falling back to the default would leave the user looking at an empty cache
+/// wondering where their models went. The default location is returned as-is,
+/// since not existing yet is its normal first-run state.
+pub fn resolve_models_dir(override_value: Option<&str>) -> markq_core::Result<PathBuf> {
+    let Some(value) = override_value else {
+        return Ok(default_models_dir());
+    };
+
+    let path = PathBuf::from(value);
+    let metadata =
+        std::fs::metadata(&path).map_err(|source| markq_core::Error::ModelsDirUnusable {
+            path: path.clone(),
+            reason: source.to_string(),
+        })?;
+    if !metadata.is_dir() {
+        return Err(markq_core::Error::ModelsDirUnusable {
+            path,
+            reason: "not a directory".to_string(),
+        });
     }
+    std::fs::read_dir(&path).map_err(|source| markq_core::Error::ModelsDirUnusable {
+        path: path.clone(),
+        reason: format!("unreadable: {source}"),
+    })?;
+
+    Ok(path)
+}
+
+/// The cache location markq uses when nothing overrides it.
+fn default_models_dir() -> PathBuf {
     let mut p = dirs::cache_dir().unwrap_or_else(|| PathBuf::from("."));
     p.push("markq");
     p.push("models");
     p
 }
 
+/// The models directory for this process, honoring `MARKQ_MODELS_DIR`.
+pub fn models_dir() -> markq_core::Result<PathBuf> {
+    resolve_models_dir(std::env::var("MARKQ_MODELS_DIR").ok().as_deref())
+}
+
+/// Refuse to load a cached file whose size disagrees with its sidecar.
+/// This is a size comparison only, run on every load, never a
+/// hash: hashing the cache on every load would make loading as slow as a
+/// fresh verification. A file with no sidecar (a pre-staged file)
+/// passes through unchecked, since there is nothing recorded to compare
+/// against.
+fn check_cached_size(path: &Path) -> Result<()> {
+    let Some(sidecar) = DigestSidecar::read_for(path)? else {
+        return Ok(());
+    };
+    let found = std::fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    if found != sidecar.size_bytes {
+        return Err(markq_core::Error::ModelSizeMismatch {
+            path: path.to_path_buf(),
+            expected: sidecar.size_bytes,
+            found,
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// Resolve a `KnownModel` to a local path, downloading if absent.
 ///
 /// Downloads run on the current tokio runtime (the CLI's `#[tokio::main]`).
-pub async fn ensure_model(model: KnownModel) -> Result<PathBuf> {
-    let (owner, name) = model.repo();
-    let filename = model.filename();
-    let local_dir = models_dir();
-    std::fs::create_dir_all(&local_dir)
-        .with_context(|| format!("create models dir {}", local_dir.display()))?;
+/// Which setting, if any, forbids this process from using the network.
+///
+/// The model-loading paths sit far below the argument parser, and an error
+/// that named the wrong setting would send the user to change something they
+/// never set. The resolved setting is published once at startup instead of
+/// being re-derived from the environment here, so the flag and the variable
+/// are reported as themselves.
+static OFFLINE_SETTING: OnceCell<Option<String>> = OnceCell::new();
 
-    let expected_path = local_dir.join(filename);
-    if expected_path.exists() {
-        info!(path = %expected_path.display(), "model already cached");
-        verify_sha256_if_known(&expected_path, model)?;
-        return Ok(expected_path);
+/// Record the setting that forbids network access, once, before any load.
+pub fn set_offline_setting(setting: Option<String>) {
+    let _ = OFFLINE_SETTING.set(setting);
+}
+
+/// The setting that forbids network access, if one does.
+pub fn offline_setting() -> Option<&'static str> {
+    OFFLINE_SETTING.get().and_then(|set| set.as_deref())
+}
+
+pub async fn ensure_model(model: KnownModel) -> Result<PathBuf> {
+    let local_dir = models_dir()?;
+    ensure_model_in(model, &local_dir, offline_setting()).await
+}
+
+/// Resolve `model` inside an explicit directory.
+///
+/// A file that is already there is used as-is, including one an operator staged
+/// with no sidecar: nothing vouches for it, but refusing it would make an
+/// air-gapped machine unusable, so it stays usable and reports as unverified.
+/// Only a file whose size disagrees with a sidecar is refused.
+pub async fn ensure_model_in(
+    model: KnownModel,
+    models_dir: &Path,
+    offline: Option<&str>,
+) -> Result<PathBuf> {
+    let target = models_dir.join(model.filename());
+    if target.exists() {
+        check_cached_size(&target)?;
+        info!(path = %target.display(), "model already cached");
+        return Ok(target);
+    }
+
+    if let Some(setting) = offline {
+        return Err(markq_core::Error::OfflineRefused {
+            role: role_for(model).as_str().to_string(),
+            setting: setting.to_string(),
+        }
+        .into());
     }
 
     info!(
-        repo = format!("{owner}/{name}"),
-        file = filename,
-        target = %expected_path.display(),
+        file = model.filename(),
+        target = %target.display(),
         "downloading model"
     );
-
     let client = HFClient::new().context("HFClient::new")?;
-    let repo = client.model(owner, name);
-    let downloaded = repo
-        .download_file()
-        .filename(filename)
-        .local_dir(local_dir.clone())
-        .send()
-        .await
-        .with_context(|| format!("hf-hub download_file {owner}/{name}/{filename}"))?;
-
-    verify_sha256_if_known(&downloaded, model)?;
-    Ok(downloaded)
+    download_model(&client, model, models_dir, offline).await
 }
 
-/// Compute the SHA-256 of `path` and compare against `model.sha256()`. If the
-/// model has no recorded digest, log a warning and return Ok.
-fn verify_sha256_if_known(path: &Path, model: KnownModel) -> Result<()> {
-    let Some(expected) = model.sha256() else {
-        warn!(
-            id = model.id(),
-            path = %path.display(),
-            "no SHA-256 pin recorded for this model; skipping verification"
-        );
-        return Ok(());
-    };
-    verify_sha256_against(path, expected)
-}
-
-/// Verify `path`'s SHA-256 matches `expected` (hex, case-insensitive).
-/// Split out from `verify_sha256_if_known` so tests can drive the mismatch
-/// branch without needing a `KnownModel` with a pinned digest.
-fn verify_sha256_against(path: &Path, expected: &str) -> Result<()> {
+/// Verify `path`'s SHA-256 matches `expected` (hex, case-insensitive). Public
+/// alongside `sha256_hex` so callers outside this module can check a file they
+/// already have against a digest they obtained elsewhere.
+pub fn verify_sha256_against(path: &Path, expected: &str) -> Result<()> {
     let actual = sha256_hex(path)?;
     if !actual.eq_ignore_ascii_case(expected) {
         return Err(anyhow!(
@@ -211,12 +724,270 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn prestaged_file_without_sidecar_loads_offline() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = KnownModel::Qwen3Embedding06B;
+        let staged = dir.path().join(model.filename());
+        std::fs::write(&staged, b"staged by an operator").unwrap();
+
+        // No sidecar, so nothing vouches for it, but refusing it would make an
+        // air-gapped machine unusable.
+        let resolved = ensure_model_in(model, dir.path(), Some("--offline"))
+            .await
+            .expect("a staged file must stay usable offline");
+        assert_eq!(resolved, staged);
+
+        let entry = CacheEntry::inspect(ModelRole::Embedder, dir.path()).unwrap();
+        assert_eq!(entry.state, CacheState::Unverified);
+    }
+
+    #[tokio::test]
+    async fn offline_load_of_an_absent_model_names_the_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = ensure_model_in(KnownModel::Qwen3Embedding06B, dir.path(), Some("--offline"))
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("--offline"), "got: {message}");
+        assert!(message.contains("embedder"), "got: {message}");
+    }
+
+    #[test]
+    fn missing_models_dir_errors_naming_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("staged-models");
+
+        let error = resolve_models_dir(Some(absent.to_str().unwrap())).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("staged-models"), "got: {message}");
+    }
+
+    #[test]
+    fn unreadable_models_dir_does_not_fall_back_to_default() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // A path that is a file, not a directory.
+        let as_file = dir.path().join("not-a-directory");
+        std::fs::write(&as_file, b"").unwrap();
+        let error = resolve_models_dir(Some(as_file.to_str().unwrap())).unwrap_err();
+        assert!(
+            error.to_string().contains("not-a-directory"),
+            "got: {error}"
+        );
+
+        // A directory the process cannot read.
+        let sealed = dir.path().join("sealed");
+        std::fs::create_dir(&sealed).unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = resolve_models_dir(Some(sealed.to_str().unwrap()));
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = result.expect_err("an unreadable directory must not be accepted");
+        assert!(error.to_string().contains("sealed"), "got: {error}");
+        assert!(
+            error.to_string().contains("unreadable"),
+            "the reason should say what is wrong: {error}"
+        );
+    }
+
+    #[test]
+    fn cache_state_matches_files_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let role = ModelRole::Embedder;
+        let model = dir.path().join(role.known_model().filename());
+
+        let entry = CacheEntry::inspect(role, dir.path()).unwrap();
+        assert_eq!(entry.state, CacheState::Absent);
+        assert_eq!(entry.size_bytes, None);
+
+        let partial = partial_path_for(&model);
+        std::fs::write(&partial, b"0123456789").unwrap();
+        let entry = CacheEntry::inspect(role, dir.path()).unwrap();
+        assert_eq!(entry.state, CacheState::Partial { bytes: 10 });
+        std::fs::remove_file(&partial).unwrap();
+
+        std::fs::write(&model, b"hello").unwrap();
+        let entry = CacheEntry::inspect(role, dir.path()).unwrap();
+        assert_eq!(entry.state, CacheState::Unverified);
+        assert_eq!(entry.size_bytes, Some(5));
+
+        DigestSidecar {
+            digest: "abc".into(),
+            size_bytes: 5,
+            source: "hub lfs metadata".into(),
+        }
+        .write_for(&model)
+        .unwrap();
+        let entry = CacheEntry::inspect(role, dir.path()).unwrap();
+        assert_eq!(entry.state, CacheState::Verified);
+        assert_eq!(entry.digest.as_deref(), Some("abc"));
+        assert_eq!(entry.digest_source.as_deref(), Some("hub lfs metadata"));
+
+        // A sidecar that disagrees about the size does not vouch for this file.
+        DigestSidecar {
+            digest: "abc".into(),
+            size_bytes: 999,
+            source: "hub lfs metadata".into(),
+        }
+        .write_for(&model)
+        .unwrap();
+        let entry = CacheEntry::inspect(role, dir.path()).unwrap();
+        assert_eq!(entry.state, CacheState::Unverified);
+    }
+
+    #[test]
+    fn sidecar_round_trips_digest_size_and_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model.gguf");
+        std::fs::write(&model, b"hello").unwrap();
+
+        let written = DigestSidecar {
+            digest: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".into(),
+            size_bytes: 5,
+            source: "hub lfs metadata".into(),
+        };
+        written.write_for(&model).unwrap();
+
+        let read = DigestSidecar::read_for(&model)
+            .unwrap()
+            .expect("sidecar present");
+        assert_eq!(read, written);
+    }
+
+    #[test]
+    fn sidecar_without_its_model_file_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model.gguf");
+        std::fs::write(&model, b"hello").unwrap();
+        DigestSidecar {
+            digest: "abc".into(),
+            size_bytes: 5,
+            source: "hub lfs metadata".into(),
+        }
+        .write_for(&model)
+        .unwrap();
+
+        assert!(!DigestSidecar::is_stale_for(&model));
+
+        std::fs::remove_file(&model).unwrap();
+        assert!(DigestSidecar::is_stale_for(&model));
+    }
+
+    #[test]
+    fn unknown_role_error_lists_valid_roles() {
+        let err = "embeder".parse::<ModelRole>().unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("embeder"), "got: {message}");
+        assert!(message.contains("embedder"), "got: {message}");
+        assert!(message.contains("reranker"), "got: {message}");
+    }
+
+    #[test]
+    fn roles_round_trip_to_known_models() {
+        for role in ModelRole::ALL {
+            assert_eq!(role.as_str().parse::<ModelRole>().unwrap(), role);
+        }
+        assert_eq!(
+            ModelRole::Embedder.known_model().id(),
+            KnownModel::Qwen3Embedding06B.id()
+        );
+        assert_eq!(
+            ModelRole::Reranker.known_model().id(),
+            KnownModel::Qwen3Reranker06B.id()
+        );
+        assert_eq!(ModelRole::Embedder.as_str(), "embedder");
+        assert_eq!(ModelRole::Reranker.as_str(), "reranker");
+    }
+
+    #[test]
+    fn digest_mismatch_refuses_and_writes_no_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("model.gguf");
+        std::fs::write(&target, b"hello").unwrap();
+
+        let partial = partial_path_for(&target);
+        std::fs::rename(&target, &partial).unwrap();
+
+        let wrong = "0000000000000000000000000000000000000000000000000000000000000000";
+        let err = verify_then_seal(&partial, &target, Some(wrong.to_string())).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("does not match"), "got: {message}");
+        assert!(
+            !DigestSidecar::path_for(&target).exists(),
+            "a mismatch must not leave a sidecar behind"
+        );
+        assert!(
+            !target.exists(),
+            "a mismatch must not leave the file under the model's own name"
+        );
+    }
+
+    #[test]
+    fn successful_download_writes_sidecar_with_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("model.gguf");
+        std::fs::write(&target, b"hello").unwrap();
+        let good = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        let partial = partial_path_for(&target);
+        std::fs::rename(&target, &partial).unwrap();
+
+        verify_then_seal(&partial, &target, Some(good.to_string())).unwrap();
+
+        let sidecar = DigestSidecar::read_for(&target)
+            .unwrap()
+            .expect("sidecar written after a matching hash");
+        assert_eq!(sidecar.digest, good);
+        assert_eq!(sidecar.size_bytes, 5);
+    }
+
+    #[test]
+    fn truncated_model_is_refused_before_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model.gguf");
+        std::fs::write(&model, b"hello").unwrap(); // 5 bytes on disk
+
+        DigestSidecar {
+            digest: "abc".into(),
+            size_bytes: 10, // the sidecar recorded a larger, complete file
+            source: "hub lfs metadata".into(),
+        }
+        .write_for(&model)
+        .unwrap();
+
+        let err = check_cached_size(&model).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("model.gguf"), "got: {message}");
+    }
+
+    #[test]
+    fn load_does_not_hash_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model.gguf");
+        std::fs::write(&model, b"hello").unwrap();
+
+        // A digest that could never match this file's real hash. If the
+        // load path hashed the file and compared it, this would fail; it
+        // passes because the load path checks size only.
+        DigestSidecar {
+            digest: "not-a-real-sha256".into(),
+            size_bytes: 5,
+            source: "hub lfs metadata".into(),
+        }
+        .write_for(&model)
+        .unwrap();
+
+        check_cached_size(&model).expect("a size-only check must not hash the file");
+    }
+
     #[test]
     fn qwen3_reranker_06b_resolves_to_expected_cache_filename() {
         let filename = KnownModel::Qwen3Reranker06B.filename();
         assert_eq!(filename, "qwen3-reranker-0.6b-q8_0.gguf");
 
-        let cache_path = models_dir().join(filename);
+        let cache_path = models_dir().unwrap().join(filename);
         let cache_path_str = cache_path.to_string_lossy();
         assert!(
             cache_path_str.ends_with("markq/models/qwen3-reranker-0.6b-q8_0.gguf"),

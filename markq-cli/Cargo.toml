@@ -38,4 +38,6 @@ vulkan = ["markq-inference/vulkan"]
 cuda = ["markq-inference/cuda"]
 
 [dev-dependencies]
+fs4.workspace = true
+markq-test-support.workspace = true
 tempfile.workspace = true

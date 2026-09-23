@@ -47,10 +47,19 @@ markq 0.1.0
 ## Global flags
 
 ```
---dataset <PATH>   Override ~/.markq/chunks.lance for this invocation.
-RUST_LOG=...       Standard tracing-subscriber filter. Default is `warn`.
-                   Examples: `markq=info`, `markq_index_lance=debug`.
+--dataset <PATH>      Override ~/.markq/chunks.lance for this invocation.
+--offline             Forbid all network access, on any subcommand.
+MARKQ_OFFLINE=...     Same, from the environment. Accepts 1/true and 0/false,
+                      case-insensitively; any other value is an error.
+MARKQ_MODELS_DIR=...  Use a pre-staged model directory instead of
+                      ~/.cache/markq/models. The directory must already exist.
+RUST_LOG=...          Standard tracing-subscriber filter. Default is `warn`.
+                      Examples: `markq=info`, `markq_index_lance=debug`.
 ```
+
+The flag beats the environment variable, which beats the default of allowing
+the network. With every model already cached, no command makes a request
+whether or not offline mode is on.
 
 ## Subcommand surface
 
@@ -132,10 +141,13 @@ Error: not implemented yet
 | `query <query>` | ✅ Implemented (BM25 + vector + weighted RRF; `--explain` available; `--rerank` for an integrated cross-encoder pass) |
 | `embed-query <query>` | ✅ Implemented (prints the query embedding as JSON for external vector search) |
 | `rerank` | ✅ Implemented (cross-encoder rerank of stdin candidates via Qwen3-Reranker-0.6B Q8_0) |
-| `get`, `multi-get`, `compact`, `doctor` | Stub |
+| `models pull [<role>]` | ✅ Implemented (resumable, digest-verified fetch of the embedder and reranker) |
+| `models ls` | ✅ Implemented (cache inventory with `--json`) |
+| `doctor` | ✅ Implemented (read-only diagnosis with `--json` and `--verify`) |
+| `get`, `multi-get`, `compact` | Stub |
 | `status`, `config` | Stub |
 | `collection {add,list,remove}` | Stub |
-| `context add`, `models {pull,ls}` | Stub |
+| `context add` | Stub |
 | `watch`, `serve` | Stub |
 | `search --explain`, `search --collection <name>` | Returns a structured "not implemented" error |
 | `vsearch --explain`, `vsearch --collection <name>` | Same — recognized but gated |
@@ -731,6 +743,149 @@ was built with a different embedder, or has no embeddings yet, it fails
 loudly with the same message as `vsearch` rather than printing a vector
 that would silently mismatch. See [`usage/duckdb.md`](duckdb.md) for the
 end-to-end SQL composition.
+
+## `markq models`
+
+Model files live flat in `~/.cache/markq/models/`, overridable with
+`MARKQ_MODELS_DIR`. Two roles are known: `embedder` and `reranker`.
+
+### `markq models ls`
+
+```sh
+markq models ls
+```
+
+```
+ROLE       STATE            SIZE  MODEL
+embedder   unverified    610 MiB  Qwen/Qwen3-Embedding-0.6B-GGUF/Q8_0
+                                  Qwen3-Embedding-0.6B-Q8_0.gguf
+reranker   unverified    610 MiB  ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/Q8_0
+                                  qwen3-reranker-0.6b-q8_0.gguf
+```
+
+A file is `verified` once markq has fetched it and recorded its digest,
+`unverified` when it is present but nothing vouches for it (a file staged by
+hand, or one that predates digest recording), `partial` while a transfer is
+unfinished, and `absent` when it is not there at all. On a machine that has
+never fetched anything:
+
+```
+ROLE       STATE            SIZE  MODEL
+embedder   absent              -  Qwen/Qwen3-Embedding-0.6B-GGUF/Q8_0
+                                  Qwen3-Embedding-0.6B-Q8_0.gguf
+reranker   absent              -  ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/Q8_0
+                                  qwen3-reranker-0.6b-q8_0.gguf
+```
+
+`--json` emits the same fields as an array, with raw byte counts:
+
+```sh
+markq models ls --json
+```
+
+```json
+[
+  {
+    "role": "embedder",
+    "model_id": "Qwen/Qwen3-Embedding-0.6B-GGUF/Q8_0",
+    "filename": "Qwen3-Embedding-0.6B-Q8_0.gguf",
+    "state": "unverified",
+    "size_bytes": 639150592,
+    "digest": null,
+    "digest_source": null
+  },
+  {
+    "role": "reranker",
+    "model_id": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/Q8_0",
+    "filename": "qwen3-reranker-0.6b-q8_0.gguf",
+    "state": "unverified",
+    "size_bytes": 639153184,
+    "digest": null,
+    "digest_source": null
+  }
+]
+```
+
+### `markq models pull`
+
+Fetches every known role, or one named role. A transfer that stops partway
+resumes from the bytes already on disk rather than starting over, and the file
+is checked against the digest the repository declares before it is moved into
+place. A model that is already verified is a no-op.
+
+Offline, the refusal says which setting forbade the fetch, and distinguishes a
+file that was never fetched from one that is merely unverified:
+
+```sh
+markq --offline models pull embedder
+```
+
+```
+embedder: failed: the embedder model is present but not verified, and --offline forbids contacting the repository to check it; run `markq models pull embedder` with network access
+Error: not every requested model could be made ready
+```
+
+Exit status is 1 when any requested role could not be made ready.
+
+## `markq doctor`
+
+Read-only. It loads no model weights, scans no rows, needs no network, and
+changes nothing; every finding names one action that clears it.
+
+```sh
+markq doctor
+```
+
+```
+[ok]       dataset.present
+[ok]       dataset.schema_version
+[ok]       dataset.embedder
+[ok]       index.lexical
+[ok]       index.vector
+[warning]  models.embedder          run `markq models pull embedder` to verify it
+           observed: present but not verified
+           expected: a verified file
+[warning]  models.reranker          run `markq models pull reranker` to verify it
+           observed: present but not verified
+           expected: a verified file
+```
+
+The checks are the dataset's presence, its recorded schema version, its
+recorded embedder identity and dimension, the lexical and vector indexes
+(reported as covered and uncovered row counts, not as a yes or no), and each
+model role's file. An installation that has never created a dataset is
+reported as uninitialized, which is a normal state rather than an error.
+
+Exit status is 1 when any finding has error severity, so a script can gate on
+it. `--json` emits the findings as an array:
+
+```sh
+markq doctor --json
+```
+
+```json
+[
+  {
+    "check": "dataset.present",
+    "severity": "ok",
+    "observed": null,
+    "expected": null,
+    "next_step": ""
+  }
+]
+```
+
+`--verify` additionally hashes every cached model in full. That reads well over
+a gigabyte, so it is opt-in: the default run compares each file's size against
+its recorded digest instead, which catches truncation and interrupted transfers
+without the wait. A file with no recorded digest has nothing to be hashed
+against, and `--verify` says so rather than appearing to have checked it:
+
+```
+[warning]  models.reranker          run `markq models pull reranker` to verify it
+           observed: present but not verified, and there is no recorded digest to check it against
+           expected: a verified file
+```
 
 ## Use a throwaway dataset
 

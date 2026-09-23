@@ -3714,10 +3714,12 @@ dependencies = [
  "arrow-schema",
  "blake3",
  "clap",
+ "fs4",
  "markq-chunker",
  "markq-core",
  "markq-index-lance",
  "markq-inference",
+ "markq-test-support",
  "serde",
  "serde_json",
  "tempfile",
@@ -3770,16 +3772,30 @@ dependencies = [
  "anyhow",
  "crossbeam-channel",
  "dirs",
+ "fs4",
+ "futures",
  "hex",
  "hf-hub",
  "llama-cpp-2",
  "markq-core",
+ "markq-test-support",
  "once_cell",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "markq-test-support"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "sha2 0.10.9",
+ "tokio",
 ]
 
 [[package]]

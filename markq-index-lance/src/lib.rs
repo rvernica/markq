@@ -20,9 +20,10 @@ use lancedb::index::Index as LanceIndexKind;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use lancedb::{DistanceType, Table};
 use markq_core::{
-    chunk_arrow_schema, ChunkColumn, ChunkHit, DatasetMetadata, Error, Index, Result,
-    EMBEDDING_DIM_DEFAULT, KEY_EMBEDDER_DIM, KEY_EMBEDDER_MODEL, KEY_LANCEDB_CRATE_VERSION,
-    KEY_LANCE_FILE_FORMAT_VERSION, KEY_LANCE_MANIFEST_VERSION, KEY_SCHEMA_VERSION, SCHEMA_VERSION,
+    chunk_arrow_schema, ChunkColumn, ChunkHit, DatasetMetadata, Error, Index, IndexCoverage,
+    IndexHealth, Result, EMBEDDING_DIM_DEFAULT, KEY_EMBEDDER_DIM, KEY_EMBEDDER_MODEL,
+    KEY_LANCEDB_CRATE_VERSION, KEY_LANCE_FILE_FORMAT_VERSION, KEY_LANCE_MANIFEST_VERSION,
+    KEY_SCHEMA_VERSION, SCHEMA_VERSION,
 };
 use tracing::{debug, info};
 
@@ -739,6 +740,43 @@ impl Index for LanceIndex {
         // `markq compact` exits cleanly during smoke tests.
         Ok(())
     }
+
+    async fn health(&self) -> Result<IndexHealth> {
+        let row_count = self.count_rows().await? as u64;
+
+        let configs = self
+            .table
+            .list_indices()
+            .await
+            .context("list indices")
+            .map_err(Error::Backend)?;
+
+        let mut indexes = Vec::with_capacity(configs.len());
+        for config in configs {
+            // `columns` is documented as always a single-element Vec in the
+            // pinned lancedb version; skip an entry with none rather than
+            // panic if that ever changes upstream.
+            let Some(column) = config.columns.first() else {
+                continue;
+            };
+            let stats = self
+                .table
+                .index_stats(&config.name)
+                .await
+                .context("index stats")
+                .map_err(Error::Backend)?;
+            let Some(stats) = stats else {
+                continue;
+            };
+            indexes.push(IndexCoverage {
+                column: column.clone(),
+                indexed_rows: stats.num_indexed_rows as u64,
+                unindexed_rows: stats.num_unindexed_rows as u64,
+            });
+        }
+
+        Ok(IndexHealth { row_count, indexes })
+    }
 }
 
 #[cfg(test)]
@@ -1068,6 +1106,82 @@ mod tests {
         assert!(
             !md.lance_file_format_version.is_empty(),
             "Lance file format version must be recorded at create time"
+        );
+    }
+
+    /// Build the vector index over whatever rows exist right now, then add
+    /// more rows without rebuilding it, so the vector column ends up
+    /// under-covering while the text column (rebuilt on every upsert) stays
+    /// fully covered.
+    #[tokio::test]
+    async fn health_reports_missing_index_and_uncovered_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chunks.lance");
+        let idx = LanceIndex::open_or_create_with_dim(&path, 4).await.unwrap();
+        let schema = idx.arrow_schema();
+
+        // No index has been built at all on an empty dataset: absent, not a
+        // false "present but empty".
+        let health = idx.health().await.unwrap();
+        assert_eq!(health.row_count, 0);
+        assert!(health.indexes.is_empty());
+
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let first_values = Float32Array::from(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        let first_embedding: ArrayRef = Arc::new(
+            FixedSizeListArray::try_new(item.clone(), 4, Arc::new(first_values), None).unwrap(),
+        );
+        let first_batch = batch_with_embedding(&schema, &["a", "b"], first_embedding);
+        idx.upsert_chunks(vec![first_batch]).await.unwrap();
+        ensure_vector_index(&idx.table).await.unwrap();
+
+        // Text is a check on the FTS index that `upsert_chunks` rebuilds
+        // every call; "embedding" has no index entry yet at this point since
+        // no index was ever created before this upsert.
+        let health = idx.health().await.unwrap();
+        assert_eq!(health.row_count, 2);
+        let text = health
+            .indexes
+            .iter()
+            .find(|c| c.column == ChunkColumn::TEXT)
+            .expect("text index present");
+        assert_eq!(text.indexed_rows, 2);
+        assert_eq!(text.unindexed_rows, 0);
+        let embedding = health
+            .indexes
+            .iter()
+            .find(|c| c.column == ChunkColumn::EMBEDDING)
+            .expect("embedding index present after ensure_vector_index");
+        assert_eq!(embedding.indexed_rows, 2);
+        assert_eq!(embedding.unindexed_rows, 0);
+
+        // Add two more rows without rebuilding the vector index. The text
+        // index self-heals (upsert_chunks rebuilds it every call); the
+        // vector index does not, so it now under-covers the dataset.
+        let second_values = Float32Array::from(vec![0.0f32, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]);
+        let second_embedding: ArrayRef =
+            Arc::new(FixedSizeListArray::try_new(item, 4, Arc::new(second_values), None).unwrap());
+        let second_batch = batch_with_embedding(&schema, &["c", "d"], second_embedding);
+        idx.upsert_chunks(vec![second_batch]).await.unwrap();
+
+        let health = idx.health().await.unwrap();
+        assert_eq!(health.row_count, 4);
+        let text = health
+            .indexes
+            .iter()
+            .find(|c| c.column == ChunkColumn::TEXT)
+            .expect("text index still present");
+        assert_eq!(text.indexed_rows, 4, "text index rebuilds on every upsert");
+        assert_eq!(text.unindexed_rows, 0);
+        let embedding = health
+            .indexes
+            .iter()
+            .find(|c| c.column == ChunkColumn::EMBEDDING)
+            .expect("embedding index still present");
+        assert_eq!(embedding.indexed_rows, 2, "vector index was never rebuilt");
+        assert_eq!(
+            embedding.unindexed_rows, 2,
+            "the two rows added after the last vector index build are uncovered"
         );
     }
 

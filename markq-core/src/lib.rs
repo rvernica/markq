@@ -14,7 +14,7 @@ pub mod rrf;
 pub mod schema;
 
 pub use error::{Error, Result};
-pub use index::{ChunkHit, Index};
+pub use index::{ChunkHit, Index, IndexCoverage, IndexHealth};
 pub use metadata::{
     DatasetMetadata, KEY_EMBEDDER_DIM, KEY_EMBEDDER_MODEL, KEY_LANCEDB_CRATE_VERSION,
     KEY_LANCE_FILE_FORMAT_VERSION, KEY_LANCE_MANIFEST_VERSION, KEY_SCHEMA_VERSION, SCHEMA_VERSION,

@@ -10,7 +10,7 @@ use markq_core::{default_dataset_path, Index};
 use markq_index_lance::LanceIndex;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use markq_cli::{embed_query, embedder_cmd, indexer, query, rerank, search, vsearch};
+use markq_cli::{embed_query, embedder_cmd, indexer, models, query, rerank, search, vsearch};
 
 /// Version string with the compiled-in inference backend appended, so
 /// `markq --version` reveals whether GPU offload is available without
@@ -22,6 +22,68 @@ const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (backend: cuda)");
 #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (backend: cpu)");
 
+/// Render a byte count the way a person reads a model file's size.
+///
+/// Small units matter here because the size column also carries the progress of
+/// an unfinished transfer, where rounding everything under a mebibyte to
+/// `0 MiB` would hide the difference between stalled and starting.
+fn human_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let value = bytes as f64;
+    if value >= GIB {
+        format!("{:.1} GiB", value / GIB)
+    } else if value >= MIB {
+        format!("{:.0} MiB", value / MIB)
+    } else if value >= KIB {
+        format!("{:.0} KiB", value / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// The environment variable that forbids network access.
+const OFFLINE_VARIABLE: &str = "MARKQ_OFFLINE";
+
+/// Which setting forbade network access, for an error that can name it. `None`
+/// means the network may be used.
+type OfflineSetting = Option<String>;
+
+/// Resolve the offline setting: the flag beats the variable, which beats the
+/// default of allowing the network.
+fn resolve_offline(flag: bool, value: Option<&str>) -> markq_core::Result<OfflineSetting> {
+    if flag {
+        return Ok(Some("--offline".to_string()));
+    }
+    Ok(if parse_offline_value(value)? {
+        Some(OFFLINE_VARIABLE.to_string())
+    } else {
+        None
+    })
+}
+
+/// Interpret one value of the offline variable.
+///
+/// Takes the value rather than reading the environment, so callers and tests
+/// share one definition of what is accepted without mutating process-global
+/// state. An unrecognized value is an error: silently reading `no` as "offline
+/// on" would forbid the network the user asked for.
+fn parse_offline_value(value: Option<&str>) -> markq_core::Result<bool> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        _ => Err(markq_core::Error::InvalidOfflineValue {
+            variable: OFFLINE_VARIABLE,
+            value: value.to_string(),
+            accepted: "1, true, 0, false".to_string(),
+        }),
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "markq",
@@ -32,6 +94,10 @@ struct Cli {
     /// Path to the chunk dataset. Defaults to `~/.markq/chunks.lance`.
     #[arg(long, global = true)]
     dataset: Option<PathBuf>,
+
+    /// Forbid all network access. Also set by `MARKQ_OFFLINE=1`.
+    #[arg(long, global = true)]
+    offline: bool,
 
     #[command(subcommand)]
     cmd: Command,
@@ -74,7 +140,7 @@ enum Command {
     /// Reclaim space from tombstoned chunks.
     Compact,
     /// Diagnose index, model, and dimension issues.
-    Doctor,
+    Doctor(DoctorArgs),
     /// Manage the GGUF model cache.
     #[command(subcommand)]
     Models(ModelsCmd),
@@ -191,6 +257,17 @@ struct WatchArgs {
     collection: Option<String>,
 }
 
+#[derive(Args, Debug)]
+struct DoctorArgs {
+    #[arg(long)]
+    json: bool,
+    /// Also compute each cached model's full digest, catching a same-length
+    /// alteration the default size-only check can't see. Slower than the
+    /// default run.
+    #[arg(long)]
+    verify: bool,
+}
+
 #[derive(Subcommand, Debug)]
 enum CollectionCmd {
     Add {
@@ -211,8 +288,13 @@ enum ContextCmd {
 
 #[derive(Subcommand, Debug)]
 enum ModelsCmd {
-    Pull { role: Option<String> },
-    Ls,
+    Pull {
+        role: Option<String>,
+    },
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -220,6 +302,12 @@ async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     let dataset_path = cli.dataset.clone().unwrap_or_else(default_dataset_path);
+    let offline = resolve_offline(cli.offline, std::env::var(OFFLINE_VARIABLE).ok().as_deref())?;
+    // Model loading sits far below argument parsing, so the resolved setting is
+    // published once here. Publishing the name, rather than re-deriving it from
+    // the environment down there, is what lets an error say `--offline` when
+    // that is what the user actually passed.
+    markq_inference::model_cache::set_offline_setting(offline.clone());
 
     match cli.cmd {
         Command::Inspect => cmd_inspect(&dataset_path).await,
@@ -231,6 +319,8 @@ async fn main() -> Result<()> {
         Command::Vsearch(args) => cmd_vsearch(&dataset_path, &args).await,
         Command::Query(args) => cmd_query(&dataset_path, &args).await,
         Command::Rerank(args) => cmd_rerank(&args).await,
+        Command::Models(cmd) => cmd_models(cmd, offline.as_deref()).await,
+        Command::Doctor(args) => cmd_doctor(&dataset_path, &args).await,
 
         // Every other v1 subcommand has its name + arg shape registered now
         // so `markq --help` matches the final surface; their bodies land
@@ -240,8 +330,6 @@ async fn main() -> Result<()> {
         | Command::Get(_)
         | Command::MultiGet(_)
         | Command::Compact
-        | Command::Doctor
-        | Command::Models(_)
         | Command::Watch(_)
         | Command::Serve
         | Command::Status
@@ -387,6 +475,91 @@ async fn cmd_rerank(args: &RerankArgs) -> Result<()> {
     .await
 }
 
+async fn cmd_models(cmd: ModelsCmd, offline: Option<&str>) -> Result<()> {
+    match cmd {
+        ModelsCmd::Pull { role } => {
+            let models_dir = markq_inference::models_dir()?;
+            let client = markq_inference::HFClient::new().context("HFClient::new")?;
+            let outcomes = models::run_pull(role.as_deref(), &models_dir, &client, offline).await?;
+
+            let mut any_failed = false;
+            for outcome in &outcomes {
+                match &outcome.result {
+                    // Not "ready": an unverified file is present without
+                    // anything vouching for it, which `ls` and `doctor` both
+                    // flag as needing action.
+                    Ok(entry) => println!(
+                        "{}: {} ({})",
+                        outcome.role.as_str(),
+                        models::state_label(&entry.state),
+                        if outcome.transferred {
+                            "fetched"
+                        } else {
+                            "already cached"
+                        }
+                    ),
+                    Err(message) => {
+                        any_failed = true;
+                        println!("{}: failed: {message}", outcome.role.as_str());
+                    }
+                }
+            }
+            if any_failed {
+                anyhow::bail!("not every requested model could be made ready");
+            }
+            Ok(())
+        }
+        ModelsCmd::Ls { json } => {
+            let models_dir = markq_inference::models_dir()?;
+            let rows = models::ls_rows(&models_dir)?;
+            if json {
+                serde_json::to_writer_pretty(std::io::stdout(), &rows)?;
+                println!();
+            } else {
+                println!("{:<10} {:<11} {:>9}  MODEL", "ROLE", "STATE", "SIZE");
+                for row in &rows {
+                    println!(
+                        "{:<10} {:<11} {:>9}  {}",
+                        row.role,
+                        row.state,
+                        row.size_bytes.map(human_size).unwrap_or_else(|| "-".into()),
+                        row.model_id,
+                    );
+                    println!("{:<34}{}", "", row.filename);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn cmd_doctor(dataset_path: &std::path::Path, args: &DoctorArgs) -> Result<()> {
+    let models_dir = markq_inference::models_dir()?;
+    let findings = markq_cli::doctor::run_doctor(dataset_path, &models_dir, args.verify).await?;
+
+    if args.json {
+        serde_json::to_writer_pretty(std::io::stdout(), &findings)?;
+        println!();
+    } else {
+        for f in &findings {
+            let tag = format!("[{}]", f.severity);
+            let line = format!("{tag:<10} {:<24} {}", f.check, f.next_step);
+            println!("{}", line.trim_end());
+            if let Some(observed) = &f.observed {
+                println!("           observed: {observed}");
+            }
+            if let Some(expected) = &f.expected {
+                println!("           expected: {expected}");
+            }
+        }
+    }
+
+    if markq_cli::doctor::any_error(&findings) {
+        anyhow::bail!("doctor found one or more error-severity findings");
+    }
+    Ok(())
+}
+
 async fn cmd_search(dataset_path: &std::path::Path, args: &QueryArgs) -> Result<()> {
     if args.collection.is_some() {
         anyhow::bail!("collection filtering is not implemented yet; omit -c for now");
@@ -516,4 +689,76 @@ fn init_tracing() {
         .with(filter)
         .with(fmt::layer().with_target(true).with_writer(std::io::stderr))
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offline_flag_accepted_on_every_subcommand() {
+        // A user should never have to know which subcommands reach the network.
+        for argv in [
+            vec!["markq", "--offline", "inspect"],
+            vec!["markq", "inspect", "--offline"],
+            vec!["markq", "search", "needle", "--offline"],
+            vec!["markq", "query", "needle", "--offline"],
+            vec!["markq", "doctor", "--offline"],
+            vec!["markq", "models", "ls", "--offline"],
+        ] {
+            let parsed = Cli::try_parse_from(&argv)
+                .unwrap_or_else(|error| panic!("{argv:?} rejected: {error}"));
+            assert!(parsed.offline, "{argv:?} did not set offline");
+        }
+    }
+
+    #[test]
+    fn flag_overrides_env_which_overrides_default() {
+        assert_eq!(resolve_offline(false, None).unwrap(), None);
+        assert_eq!(
+            resolve_offline(false, Some("1")).unwrap().as_deref(),
+            Some("MARKQ_OFFLINE")
+        );
+        assert_eq!(
+            resolve_offline(true, None).unwrap().as_deref(),
+            Some("--offline")
+        );
+        // The flag is the stronger statement, so it wins over a variable that
+        // says otherwise.
+        assert_eq!(
+            resolve_offline(true, Some("0")).unwrap().as_deref(),
+            Some("--offline")
+        );
+        assert_eq!(resolve_offline(false, Some("false")).unwrap(), None);
+    }
+
+    #[test]
+    fn offline_env_accepts_documented_values_case_insensitively() {
+        for on in ["1", "true", "TRUE", "True"] {
+            assert!(
+                parse_offline_value(Some(on)).unwrap(),
+                "{on:?} should mean offline"
+            );
+        }
+        for off in ["0", "false", "FALSE", "False"] {
+            assert!(
+                !parse_offline_value(Some(off)).unwrap(),
+                "{off:?} should mean online"
+            );
+        }
+        assert!(
+            !parse_offline_value(None).unwrap(),
+            "unset should mean online"
+        );
+    }
+
+    #[test]
+    fn offline_env_rejects_unrecognized_value() {
+        let error = parse_offline_value(Some("maybe")).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("MARKQ_OFFLINE"), "got: {message}");
+        assert!(message.contains("maybe"), "got: {message}");
+        // The message has to say what would have worked.
+        assert!(message.contains("true"), "got: {message}");
+    }
 }
