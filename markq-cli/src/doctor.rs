@@ -541,9 +541,20 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Warning);
         assert!(
-            findings[0].next_step.contains("resume"),
+            findings[0].next_step.contains("markq models pull"),
             "got: {}",
             findings[0].next_step
+        );
+        // The byte count is the useful part, and it must not claim a cause the
+        // local state cannot distinguish.
+        assert!(
+            findings[0]
+                .observed
+                .as_deref()
+                .unwrap_or_default()
+                .contains("10 byte(s)"),
+            "got: {:?}",
+            findings[0].observed
         );
     }
 
