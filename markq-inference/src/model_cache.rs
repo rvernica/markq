@@ -11,6 +11,7 @@ use fs4::FileExt;
 use futures::StreamExt;
 use hf_hub::repository::files::RepoTreeEntry;
 use hf_hub::HFClient;
+use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
@@ -570,13 +571,28 @@ fn check_cached_size(path: &Path) -> Result<()> {
 /// Resolve a `KnownModel` to a local path, downloading if absent.
 ///
 /// Downloads run on the current tokio runtime (the CLI's `#[tokio::main]`).
+/// Which setting, if any, forbids this process from using the network.
+///
+/// The model-loading paths sit far below the argument parser, and an error
+/// that named the wrong setting would send the user to change something they
+/// never set. The resolved setting is published once at startup instead of
+/// being re-derived from the environment here, so the flag and the variable
+/// are reported as themselves.
+static OFFLINE_SETTING: OnceCell<Option<String>> = OnceCell::new();
+
+/// Record the setting that forbids network access, once, before any load.
+pub fn set_offline_setting(setting: Option<String>) {
+    let _ = OFFLINE_SETTING.set(setting);
+}
+
+/// The setting that forbids network access, if one does.
+pub fn offline_setting() -> Option<&'static str> {
+    OFFLINE_SETTING.get().and_then(|set| set.as_deref())
+}
+
 pub async fn ensure_model(model: KnownModel) -> Result<PathBuf> {
     let local_dir = models_dir()?;
-    let offline = std::env::var("MARKQ_OFFLINE")
-        .ok()
-        .filter(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true"))
-        .map(|_| "MARKQ_OFFLINE".to_string());
-    ensure_model_in(model, &local_dir, offline.as_deref()).await
+    ensure_model_in(model, &local_dir, offline_setting()).await
 }
 
 /// Resolve `model` inside an explicit directory.

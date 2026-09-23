@@ -294,12 +294,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let dataset_path = cli.dataset.clone().unwrap_or_else(default_dataset_path);
     let offline = resolve_offline(cli.offline, std::env::var(OFFLINE_VARIABLE).ok().as_deref())?;
-    // Model loading deep in the embedder and reranker paths reads the variable
-    // rather than taking a parameter, so the flag is published here, once, at
-    // startup. Without this the flag would be global in name only.
-    if cli.offline {
-        std::env::set_var(OFFLINE_VARIABLE, "1");
-    }
+    // Model loading sits far below argument parsing, so the resolved setting is
+    // published once here. Publishing the name, rather than re-deriving it from
+    // the environment down there, is what lets an error say `--offline` when
+    // that is what the user actually passed.
+    markq_inference::model_cache::set_offline_setting(offline.clone());
 
     match cli.cmd {
         Command::Inspect => cmd_inspect(&dataset_path).await,
@@ -477,14 +476,17 @@ async fn cmd_models(cmd: ModelsCmd, offline: Option<&str>) -> Result<()> {
             let mut any_failed = false;
             for outcome in &outcomes {
                 match &outcome.result {
+                    // Not "ready": an unverified file is present without
+                    // anything vouching for it, which `ls` and `doctor` both
+                    // flag as needing action.
                     Ok(entry) => println!(
-                        "{}: ready ({:?}{})",
+                        "{}: {} ({})",
                         outcome.role.as_str(),
-                        entry.state,
+                        models::state_label(&entry.state),
                         if outcome.transferred {
-                            ", fetched"
+                            "fetched"
                         } else {
-                            ", already cached"
+                            "already cached"
                         }
                     ),
                     Err(message) => {

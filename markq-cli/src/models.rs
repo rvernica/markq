@@ -82,15 +82,20 @@ pub struct ModelRow {
     pub digest_source: Option<String>,
 }
 
+/// The word every command uses for a cache state, so the listing, the pull
+/// summary, and the diagnosis never describe the same file differently.
+pub fn state_label(state: &CacheState) -> &'static str {
+    match state {
+        CacheState::Absent => "absent",
+        CacheState::Partial { .. } => "partial",
+        CacheState::Unverified => "unverified",
+        CacheState::Verified => "verified",
+    }
+}
+
 impl ModelRow {
     fn from_entry(entry: CacheEntry) -> Self {
-        let state = match entry.state {
-            CacheState::Absent => "absent",
-            CacheState::Partial { .. } => "partial",
-            CacheState::Unverified => "unverified",
-            CacheState::Verified => "verified",
-        }
-        .to_string();
+        let state = state_label(&entry.state).to_string();
         Self {
             role: entry.role.as_str().to_string(),
             model_id: entry.role.known_model().id().to_string(),
