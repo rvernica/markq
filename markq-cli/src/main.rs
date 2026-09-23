@@ -211,8 +211,13 @@ enum ContextCmd {
 
 #[derive(Subcommand, Debug)]
 enum ModelsCmd {
-    Pull { role: Option<String> },
-    Ls,
+    Pull {
+        role: Option<String>,
+    },
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -418,7 +423,28 @@ async fn cmd_models(cmd: ModelsCmd) -> Result<()> {
             }
             Ok(())
         }
-        ModelsCmd::Ls => anyhow::bail!("not implemented yet"),
+        ModelsCmd::Ls { json } => {
+            let models_dir = markq_inference::models_dir();
+            let rows = models::ls_rows(&models_dir)?;
+            if json {
+                serde_json::to_writer_pretty(std::io::stdout(), &rows)?;
+                println!();
+            } else {
+                for row in &rows {
+                    println!(
+                        "{:<10} {:<10} {:>14} {}  {}",
+                        row.role,
+                        row.state,
+                        row.size_bytes
+                            .map(|bytes| bytes.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        row.digest.as_deref().unwrap_or("-"),
+                        row.filename,
+                    );
+                }
+            }
+            Ok(())
+        }
     }
 }
 
