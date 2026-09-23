@@ -3,6 +3,7 @@
 //! spawning the binary.
 
 pub mod candidate;
+pub mod doctor;
 pub mod embed_query;
 pub mod embedder_cmd;
 pub mod indexer;
