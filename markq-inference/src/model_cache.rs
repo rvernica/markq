@@ -7,6 +7,7 @@ use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
+use fs4::FileExt;
 use futures::StreamExt;
 use hf_hub::repository::files::RepoTreeEntry;
 use hf_hub::HFClient;
@@ -70,6 +71,27 @@ pub async fn download_model(
         .with_context(|| format!("create models dir {}", models_dir.display()))?;
     let target = models_dir.join(model.filename());
     let partial = partial_path_for(&target);
+
+    // Hold this model's lock for the rest of the function, so a second
+    // caller fails immediately instead of racing this transfer (FR-010a,
+    // FR-010b). The lock releases when `lock` drops at function return.
+    let lock_path = lock_path_for(&target);
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("open lock {}", lock_path.display()))?;
+    if let Err(err) = lock.try_lock_exclusive() {
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            return Err(markq_core::Error::ModelDownloadInProgress {
+                role: role_for(model).as_str().to_string(),
+                path: lock_path,
+            }
+            .into());
+        }
+        return Err(err).with_context(|| format!("lock {}", lock_path.display()));
+    }
 
     let (owner, name) = model.repo();
     let repo = client.model(owner, name);
@@ -216,6 +238,23 @@ pub fn partial_path_for(model_path: &Path) -> PathBuf {
     let mut name = model_path.as_os_str().to_os_string();
     name.push(".partial");
     PathBuf::from(name)
+}
+
+/// The advisory lock scoped to one model's download, so a download of one
+/// model never blocks a download of another (FR-010a).
+pub fn lock_path_for(model_path: &Path) -> PathBuf {
+    let mut name = model_path.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// The role that fetches `model`, for naming it in a contended-lock error.
+/// Every `KnownModel` variant has exactly one corresponding role.
+fn role_for(model: KnownModel) -> ModelRole {
+    ModelRole::ALL
+        .into_iter()
+        .find(|role| role.known_model().filename() == model.filename())
+        .expect("every KnownModel has a corresponding ModelRole")
 }
 
 /// What the cache knows about one role's file.

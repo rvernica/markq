@@ -2,10 +2,11 @@
 
 mod support;
 
+use fs4::FileExt;
 use hf_hub::HFClient;
 use markq_inference::model_cache::{
-    declared_digest, download_model, partial_path_for, CacheEntry, CacheState, KnownModel,
-    ModelRole,
+    declared_digest, download_model, lock_path_for, partial_path_for, CacheEntry, CacheState,
+    KnownModel, ModelRole,
 };
 use support::{Behavior, FakeHub};
 
@@ -125,5 +126,73 @@ async fn partial_file_is_never_used_as_complete() {
             .unwrap()
             .state,
         CacheState::Partial { bytes: 512 }
+    );
+}
+
+#[tokio::test]
+async fn second_download_of_same_model_fails_immediately() {
+    let model = KnownModel::Qwen3Embedding06B;
+    let hub = FakeHub::spawn_for(model.filename(), sample_content(), Behavior::Complete).await;
+    let client = HFClient::builder()
+        .endpoint(hub.endpoint())
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let target = dir.path().join(model.filename());
+
+    // Stand in for another process already downloading this model.
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path_for(&target))
+        .unwrap();
+    held.try_lock_exclusive().unwrap();
+
+    let result = download_model(&client, model, dir.path()).await;
+
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.contains("already running"),
+        "expected an in-progress message, got: {message}"
+    );
+    assert_eq!(
+        hub.request_count(),
+        0,
+        "a contended lock must be refused before the hub is contacted"
+    );
+}
+
+#[tokio::test]
+async fn downloads_of_different_models_do_not_block() {
+    let embedder = KnownModel::Qwen3Embedding06B;
+    let reranker = KnownModel::Qwen3Reranker06B;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let embedder_target = dir.path().join(embedder.filename());
+
+    // Hold the embedder's lock, as if its download were already in progress.
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path_for(&embedder_target))
+        .unwrap();
+    held.try_lock_exclusive().unwrap();
+
+    let content = sample_content();
+    let hub = FakeHub::spawn_for(reranker.filename(), content, Behavior::Complete).await;
+    let client = HFClient::builder()
+        .endpoint(hub.endpoint())
+        .build()
+        .unwrap();
+
+    let result = download_model(&client, reranker, dir.path()).await;
+
+    assert!(
+        result.is_ok(),
+        "a lock on a different model must not block this one: {:?}",
+        result.err()
     );
 }
