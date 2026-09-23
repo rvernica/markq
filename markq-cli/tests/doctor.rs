@@ -202,3 +202,46 @@ async fn diagnostic_messages_are_free_of_roadmap_language() {
         }
     }
 }
+
+#[tokio::test]
+async fn prestaged_file_is_reported_unverified_in_ls_and_doctor() {
+    let models_dir = tempfile::tempdir().unwrap();
+    let role = markq_inference::model_cache::ModelRole::Embedder;
+    let staged = models_dir.path().join(role.known_model().filename());
+    std::fs::write(&staged, b"staged by an operator").unwrap();
+
+    // The listing shows it present but vouched for by nothing.
+    let rows = markq_cli::models::ls_rows(models_dir.path()).unwrap();
+    let embedder = rows
+        .iter()
+        .find(|row| row.role == "embedder")
+        .expect("embedder row");
+    assert_eq!(embedder.state, "unverified");
+
+    // And the diagnosis says the same, rather than calling it healthy or missing.
+    let dataset_dir = tempfile::tempdir().unwrap();
+    let findings = run_doctor(
+        &dataset_dir.path().join("chunks.lance"),
+        models_dir.path(),
+        false,
+    )
+    .await
+    .unwrap();
+    let finding = findings
+        .iter()
+        .find(|f| f.check == "models.embedder")
+        .expect("models.embedder finding");
+    assert!(
+        finding
+            .observed
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not verified"),
+        "expected the finding to say the file is not verified, got: {:?}",
+        finding.observed
+    );
+    assert!(
+        !finding.next_step.is_empty(),
+        "an unverified staged file should say what would establish its digest"
+    );
+}

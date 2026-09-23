@@ -559,37 +559,47 @@ fn check_cached_size(path: &Path) -> Result<()> {
 ///
 /// Downloads run on the current tokio runtime (the CLI's `#[tokio::main]`).
 pub async fn ensure_model(model: KnownModel) -> Result<PathBuf> {
-    let (owner, name) = model.repo();
-    let filename = model.filename();
     let local_dir = models_dir()?;
-    std::fs::create_dir_all(&local_dir)
-        .with_context(|| format!("create models dir {}", local_dir.display()))?;
+    let offline = std::env::var("MARKQ_OFFLINE")
+        .ok()
+        .filter(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true"))
+        .map(|_| "MARKQ_OFFLINE".to_string());
+    ensure_model_in(model, &local_dir, offline.as_deref()).await
+}
 
-    let expected_path = local_dir.join(filename);
-    if expected_path.exists() {
-        check_cached_size(&expected_path)?;
-        info!(path = %expected_path.display(), "model already cached");
-        return Ok(expected_path);
+/// Resolve `model` inside an explicit directory.
+///
+/// A file that is already there is used as-is, including one an operator staged
+/// with no sidecar: nothing vouches for it, but refusing it would make an
+/// air-gapped machine unusable, so it stays usable and reports as unverified.
+/// Only a file whose size disagrees with a sidecar is refused.
+pub async fn ensure_model_in(
+    model: KnownModel,
+    models_dir: &Path,
+    offline: Option<&str>,
+) -> Result<PathBuf> {
+    let target = models_dir.join(model.filename());
+    if target.exists() {
+        check_cached_size(&target)?;
+        info!(path = %target.display(), "model already cached");
+        return Ok(target);
+    }
+
+    if let Some(setting) = offline {
+        return Err(markq_core::Error::OfflineRefused {
+            role: role_for(model).as_str().to_string(),
+            setting: setting.to_string(),
+        }
+        .into());
     }
 
     info!(
-        repo = format!("{owner}/{name}"),
-        file = filename,
-        target = %expected_path.display(),
+        file = model.filename(),
+        target = %target.display(),
         "downloading model"
     );
-
     let client = HFClient::new().context("HFClient::new")?;
-    let repo = client.model(owner, name);
-    let downloaded = repo
-        .download_file()
-        .filename(filename)
-        .local_dir(local_dir.clone())
-        .send()
-        .await
-        .with_context(|| format!("hf-hub download_file {owner}/{name}/{filename}"))?;
-
-    Ok(downloaded)
+    download_model(&client, model, models_dir, offline).await
 }
 
 /// Verify `path`'s SHA-256 matches `expected` (hex, case-insensitive). Public
@@ -665,6 +675,35 @@ mod tests {
             msg.contains(good),
             "error should report actual digest: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn prestaged_file_without_sidecar_loads_offline() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = KnownModel::Qwen3Embedding06B;
+        let staged = dir.path().join(model.filename());
+        std::fs::write(&staged, b"staged by an operator").unwrap();
+
+        // No sidecar, so nothing vouches for it, but refusing it would make an
+        // air-gapped machine unusable.
+        let resolved = ensure_model_in(model, dir.path(), Some("--offline"))
+            .await
+            .expect("a staged file must stay usable offline");
+        assert_eq!(resolved, staged);
+
+        let entry = CacheEntry::inspect(ModelRole::Embedder, dir.path()).unwrap();
+        assert_eq!(entry.state, CacheState::Unverified);
+    }
+
+    #[tokio::test]
+    async fn offline_load_of_an_absent_model_names_the_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = ensure_model_in(KnownModel::Qwen3Embedding06B, dir.path(), Some("--offline"))
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("--offline"), "got: {message}");
+        assert!(message.contains("embedder"), "got: {message}");
     }
 
     #[test]

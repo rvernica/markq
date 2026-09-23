@@ -282,6 +282,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let dataset_path = cli.dataset.clone().unwrap_or_else(default_dataset_path);
     let offline = resolve_offline(cli.offline, std::env::var(OFFLINE_VARIABLE).ok().as_deref())?;
+    // Model loading deep in the embedder and reranker paths reads the variable
+    // rather than taking a parameter, so the flag is published here, once, at
+    // startup. Without this the flag would be global in name only.
+    if cli.offline {
+        std::env::set_var(OFFLINE_VARIABLE, "1");
+    }
 
     match cli.cmd {
         Command::Inspect => cmd_inspect(&dataset_path).await,
