@@ -877,8 +877,15 @@ markq doctor --json
 
 `--verify` additionally hashes every cached model in full. That reads well over
 a gigabyte, so it is opt-in: the default run compares each file's size against
-its recorded digest instead, which catches truncation and interrupted
-transfers without the wait.
+its recorded digest instead, which catches truncation and interrupted transfers
+without the wait. A file with no recorded digest has nothing to be hashed
+against, and `--verify` says so rather than appearing to have checked it:
+
+```
+[warning]  models.reranker          run `markq models pull reranker` to verify it
+           observed: present but not verified, and there is no recorded digest to check it against
+           expected: a verified file
+```
 
 ## Use a throwaway dataset
 

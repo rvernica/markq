@@ -310,7 +310,13 @@ fn check_model(
             ),
             CacheState::Unverified => Diagnostic::warning(
                 &check,
-                "present but not verified",
+                if verify {
+                    // Saying nothing here would let a full-verification run
+                    // look like it had examined a file it never hashed.
+                    "present but not verified, and there is no recorded digest to check it against"
+                } else {
+                    "present but not verified"
+                },
                 "a verified file",
                 format!("run `markq models pull {}` to verify it", role.as_str()),
             ),

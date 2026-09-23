@@ -245,3 +245,32 @@ async fn prestaged_file_is_reported_unverified_in_ls_and_doctor() {
         "an unverified staged file should say what would establish its digest"
     );
 }
+
+#[tokio::test]
+async fn verify_says_when_it_cannot_check_an_unverified_file() {
+    let models_dir = tempfile::tempdir().unwrap();
+    let role = markq_inference::model_cache::ModelRole::Embedder;
+    std::fs::write(
+        models_dir.path().join(role.known_model().filename()),
+        b"staged by an operator",
+    )
+    .unwrap();
+
+    let findings = markq_cli::doctor::check_models(models_dir.path(), true).unwrap();
+    let finding = findings
+        .iter()
+        .find(|f| f.check == "models.embedder")
+        .expect("models.embedder finding");
+
+    // Asking for full verification and silently checking nothing would leave
+    // the user believing the file had been examined.
+    assert!(
+        finding
+            .observed
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no recorded digest"),
+        "expected --verify to say it had nothing to check against, got: {:?}",
+        finding.observed
+    );
+}
