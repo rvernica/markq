@@ -252,6 +252,32 @@ pub fn lock_path_for(model_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Whether another process currently holds `model_path`'s download lock. A
+/// lock file that exists but that nobody holds is not a problem (FR-010c) —
+/// this probes the lock itself rather than trusting the file's mere presence,
+/// so a lock file left behind by a process that exited normally is never
+/// mistaken for a download in progress.
+pub fn download_in_progress(model_path: &Path) -> Result<bool> {
+    let lock_path = lock_path_for(model_path);
+    if !lock_path.exists() {
+        return Ok(false);
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("open lock {}", lock_path.display()))?;
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            file.unlock()
+                .with_context(|| format!("unlock {}", lock_path.display()))?;
+            Ok(false)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+        Err(err) => Err(err).with_context(|| format!("probe lock {}", lock_path.display())),
+    }
+}
+
 /// The role that fetches `model`, for naming it in a contended-lock error.
 /// Every `KnownModel` variant has exactly one corresponding role.
 fn role_for(model: KnownModel) -> ModelRole {

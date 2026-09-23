@@ -10,7 +10,7 @@ use markq_core::{
     ChunkColumn, DatasetMetadata, Index, IndexHealth, EMBEDDING_DIM_DEFAULT, SCHEMA_VERSION,
 };
 use markq_index_lance::LanceIndex;
-use markq_inference::model_cache::ModelRole;
+use markq_inference::model_cache::{self, CacheEntry, CacheState, DigestSidecar, ModelRole};
 use serde::Serialize;
 
 /// Severity of one diagnostic finding (data-model.md `Diagnostic`).
@@ -239,6 +239,77 @@ fn check_one_index(
     }
 }
 
+/// Every known role's model-cache finding (FR-018).
+pub fn check_models(models_dir: &Path) -> anyhow::Result<Vec<Diagnostic>> {
+    let mut findings = Vec::new();
+    for role in ModelRole::ALL {
+        findings.extend(check_model(role, models_dir)?);
+    }
+    Ok(findings)
+}
+
+/// One role's model-cache finding: presence/completeness/verification, plus
+/// a separate finding when its download lock is currently held (FR-020: this
+/// never loads the model; `CacheEntry::inspect` only stats files).
+fn check_model(role: ModelRole, models_dir: &Path) -> anyhow::Result<Vec<Diagnostic>> {
+    let check = format!("models.{}", role.as_str());
+    let model_path = models_dir.join(role.known_model().filename());
+    let mut findings = Vec::new();
+
+    if DigestSidecar::is_stale_for(&model_path) {
+        findings.push(Diagnostic::warning(
+            &check,
+            "a digest record with no matching file (stale sidecar)",
+            "a verified file matching its digest record",
+            format!(
+                "run `markq models pull {}` to fetch it again",
+                role.as_str()
+            ),
+        ));
+    } else {
+        let entry = CacheEntry::inspect(role, models_dir)
+            .with_context(|| format!("inspect {} cache entry", role.as_str()))?;
+        findings.push(match entry.state {
+            CacheState::Absent => Diagnostic::error(
+                &check,
+                "not cached",
+                "cached and verified",
+                format!("run `markq models pull {}` to fetch it", role.as_str()),
+            ),
+            CacheState::Partial { bytes } => Diagnostic::warning(
+                &check,
+                format!("incomplete download ({bytes} byte(s) so far)"),
+                "a complete, verified file",
+                format!(
+                    "run `markq models pull {}` to resume the download",
+                    role.as_str()
+                ),
+            ),
+            CacheState::Unverified => Diagnostic::warning(
+                &check,
+                "present but not verified",
+                "a verified file",
+                format!("run `markq models pull {}` to verify it", role.as_str()),
+            ),
+            CacheState::Verified => Diagnostic::ok(&check),
+        });
+    }
+
+    if model_cache::download_in_progress(&model_path)? {
+        findings.push(Diagnostic::warning(
+            format!("{check}.download"),
+            "a download is currently in progress",
+            "no in-progress download",
+            format!(
+                "wait for the `markq models pull {}` in progress to finish, then re-run `markq doctor`",
+                role.as_str()
+            ),
+        ));
+    }
+
+    Ok(findings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,6 +436,149 @@ mod tests {
                 finding.check
             );
         }
+    }
+
+    #[test]
+    fn missing_model_names_the_pull_command() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let findings = check_model(ModelRole::Embedder, dir.path()).unwrap();
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].check, "models.embedder");
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert!(
+            findings[0].next_step.contains("markq models pull embedder"),
+            "got: {}",
+            findings[0].next_step
+        );
+    }
+
+    #[test]
+    fn partial_model_is_reported_resumable() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir
+            .path()
+            .join(ModelRole::Embedder.known_model().filename());
+        std::fs::write(
+            markq_inference::model_cache::partial_path_for(&model_path),
+            b"0123456789",
+        )
+        .unwrap();
+
+        let findings = check_model(ModelRole::Embedder, dir.path()).unwrap();
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert!(
+            findings[0].next_step.contains("resume"),
+            "got: {}",
+            findings[0].next_step
+        );
+    }
+
+    #[test]
+    fn stale_sidecar_is_not_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir
+            .path()
+            .join(ModelRole::Embedder.known_model().filename());
+        markq_inference::model_cache::DigestSidecar {
+            digest: "abc".into(),
+            size_bytes: 5,
+            source: "hub lfs metadata".into(),
+        }
+        .write_for(&model_path)
+        .unwrap();
+
+        let findings = check_model(ModelRole::Embedder, dir.path()).unwrap();
+
+        assert_eq!(findings.len(), 1);
+        assert_ne!(
+            findings[0].severity,
+            Severity::Ok,
+            "a stale sidecar with no matching file must not read as verified"
+        );
+    }
+
+    #[test]
+    fn held_lock_is_reported_as_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir
+            .path()
+            .join(ModelRole::Embedder.known_model().filename());
+        let content = b"hello";
+        std::fs::write(&model_path, content).unwrap();
+        markq_inference::model_cache::DigestSidecar {
+            digest: markq_inference::sha256_hex(&model_path).unwrap(),
+            size_bytes: content.len() as u64,
+            source: "hub lfs metadata".into(),
+        }
+        .write_for(&model_path)
+        .unwrap();
+
+        let lock_path = markq_inference::model_cache::lock_path_for(&model_path);
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        fs4::FileExt::try_lock_exclusive(&lock_file).unwrap();
+
+        let findings = check_model(ModelRole::Embedder, dir.path()).unwrap();
+
+        fs4::FileExt::unlock(&lock_file).unwrap();
+
+        assert_eq!(findings.len(), 2);
+        assert_eq!(
+            findings[0].severity,
+            Severity::Ok,
+            "the file itself is fine"
+        );
+        assert_eq!(findings[1].severity, Severity::Warning);
+        assert!(
+            findings[1]
+                .observed
+                .as_deref()
+                .unwrap()
+                .contains("progress"),
+            "got: {:?}",
+            findings[1].observed
+        );
+    }
+
+    #[test]
+    fn unheld_lock_file_is_not_reported_as_a_problem() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir
+            .path()
+            .join(ModelRole::Embedder.known_model().filename());
+        let content = b"hello";
+        std::fs::write(&model_path, content).unwrap();
+        markq_inference::model_cache::DigestSidecar {
+            digest: markq_inference::sha256_hex(&model_path).unwrap(),
+            size_bytes: content.len() as u64,
+            source: "hub lfs metadata".into(),
+        }
+        .write_for(&model_path)
+        .unwrap();
+        // A lock file left on disk (e.g. by a process that exited normally)
+        // but not currently held by anyone.
+        std::fs::write(
+            markq_inference::model_cache::lock_path_for(&model_path),
+            b"",
+        )
+        .unwrap();
+
+        let findings = check_model(ModelRole::Embedder, dir.path()).unwrap();
+
+        assert_eq!(
+            findings.len(),
+            1,
+            "an unheld lock file must not add a finding"
+        );
+        assert_eq!(findings[0].severity, Severity::Ok);
     }
 
     #[test]
