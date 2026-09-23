@@ -3,7 +3,7 @@
 //! `$MARKQ_MODELS_DIR` when set).
 
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -12,7 +12,7 @@ use hf_hub::repository::files::RepoTreeEntry;
 use hf_hub::HFClient;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Curated set of GGUFs markq knows how to fetch. Each new model that's
 /// needed adds an entry. v1 ships the embedder and a cross-encoder reranker;
@@ -53,6 +53,94 @@ impl KnownModel {
             KnownModel::Qwen3Reranker06B => "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/Q8_0",
         }
     }
+}
+
+/// Fetch `model` into `models_dir`, continuing an unfinished transfer rather
+/// than starting over.
+///
+/// Bytes accumulate in a partial file beside the target and are renamed into
+/// place only once the transfer is the size the repository declared, so a
+/// reader never observes a short file under the model's own name.
+pub async fn download_model(
+    client: &HFClient,
+    model: KnownModel,
+    models_dir: &Path,
+) -> Result<PathBuf> {
+    std::fs::create_dir_all(models_dir)
+        .with_context(|| format!("create models dir {}", models_dir.display()))?;
+    let target = models_dir.join(model.filename());
+    let partial = partial_path_for(&target);
+
+    let (owner, name) = model.repo();
+    let repo = client.model(owner, name);
+    let metadata = repo
+        .get_file_metadata()
+        .filepath(model.filename())
+        .send()
+        .await
+        .with_context(|| format!("read metadata for {owner}/{name}/{}", model.filename()))?;
+    let total = metadata.file_size;
+
+    let mut have = match std::fs::metadata(&partial) {
+        Ok(found) => found.len(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(err) => return Err(err).with_context(|| format!("stat {}", partial.display())),
+    };
+
+    // A partial that already meets or exceeds the declared size cannot be a
+    // prefix of the file being fetched, so it is discarded rather than resumed.
+    if have >= total {
+        if have > 0 {
+            warn!(
+                path = %partial.display(),
+                have,
+                total,
+                "discarding an unfinished transfer that is not a prefix of the declared file"
+            );
+            std::fs::remove_file(&partial)
+                .with_context(|| format!("remove {}", partial.display()))?;
+        }
+        have = 0;
+    }
+
+    let range = if have > 0 { Some(have..total) } else { None };
+    let (_, mut stream) = repo
+        .download_file_stream()
+        .filename(model.filename())
+        .maybe_range(range)
+        .send()
+        .await
+        .with_context(|| format!("fetch {owner}/{name}/{}", model.filename()))?;
+
+    let mut sink = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&partial)
+        .with_context(|| format!("open {}", partial.display()))?;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.with_context(|| format!("read body for {}", model.filename()))?;
+        sink.write_all(&chunk)
+            .with_context(|| format!("write {}", partial.display()))?;
+    }
+    sink.flush()
+        .with_context(|| format!("flush {}", partial.display()))?;
+    drop(sink);
+
+    let written = std::fs::metadata(&partial)
+        .with_context(|| format!("stat {}", partial.display()))?
+        .len();
+    if written != total {
+        return Err(markq_core::Error::ModelFileIncomplete {
+            path: partial,
+            have: written,
+            expected: total,
+        }
+        .into());
+    }
+
+    std::fs::rename(&partial, &target)
+        .with_context(|| format!("rename into {}", target.display()))?;
+    Ok(target)
 }
 
 /// The digest the repository declares for this model's file, when it declares

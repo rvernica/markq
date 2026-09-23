@@ -9,7 +9,7 @@
 #![allow(dead_code)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -35,6 +35,7 @@ pub struct FakeHub {
     sha256: String,
     filename: String,
     requests: Arc<AtomicUsize>,
+    last_range: Arc<Mutex<Option<(u64, Option<u64>)>>>,
 }
 
 impl FakeHub {
@@ -61,6 +62,8 @@ impl FakeHub {
         let digest = sha256.clone();
         let advertised = filename.to_string();
         let counter = Arc::clone(&requests);
+        let last_range = Arc::new(Mutex::new(None));
+        let ranges = Arc::clone(&last_range);
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -70,8 +73,9 @@ impl FakeHub {
                 let body = body.clone();
                 let digest = digest.clone();
                 let advertised = advertised.clone();
+                let ranges = Arc::clone(&ranges);
                 tokio::spawn(async move {
-                    let _ = serve(stream, body, digest, advertised, behavior).await;
+                    let _ = serve(stream, body, digest, advertised, behavior, ranges).await;
                 });
             }
         });
@@ -82,6 +86,7 @@ impl FakeHub {
             sha256,
             filename: filename.to_string(),
             requests,
+            last_range,
         }
     }
 
@@ -103,6 +108,12 @@ impl FakeHub {
         &self.sha256
     }
 
+    /// The byte range of the most recent content request, if it carried one.
+    /// A resumed transfer asks for a range starting at what is already on disk.
+    pub fn last_range(&self) -> Option<(u64, Option<u64>)> {
+        *self.last_range.lock().unwrap()
+    }
+
     /// Connections accepted so far. Zero proves a code path stayed offline.
     pub fn request_count(&self) -> usize {
         self.requests.load(Ordering::SeqCst)
@@ -121,6 +132,7 @@ async fn serve(
     digest: String,
     filename: String,
     behavior: Behavior,
+    ranges: Arc<Mutex<Option<(u64, Option<u64>)>>>,
 ) -> std::io::Result<()> {
     let request = read_request(&mut stream).await?;
     let (method, target) = request_line(&request);
@@ -154,7 +166,12 @@ async fn serve(
         return write_head(&mut stream, 200, "OK", &headers).await;
     }
 
-    match parse_range(&request) {
+    let requested = parse_range(&request);
+    if let Some((start, end)) = requested {
+        *ranges.lock().unwrap() = Some((start as u64, end.map(|value| value as u64)));
+    }
+
+    match requested {
         Some((start, end)) => {
             let end = end
                 .unwrap_or(length.saturating_sub(1))

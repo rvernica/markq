@@ -3,7 +3,10 @@
 mod support;
 
 use hf_hub::HFClient;
-use markq_inference::model_cache::{declared_digest, KnownModel};
+use markq_inference::model_cache::{
+    declared_digest, download_model, partial_path_for, CacheEntry, CacheState, KnownModel,
+    ModelRole,
+};
 use support::{Behavior, FakeHub};
 
 fn sample_content() -> Vec<u8> {
@@ -65,4 +68,62 @@ async fn absent_declared_digest_yields_unverified() {
         .unwrap();
 
     assert_eq!(declared_digest(&client, model).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn interrupted_download_resumes_from_partial() {
+    let model = KnownModel::Qwen3Embedding06B;
+    let content = sample_content();
+    let hub = FakeHub::spawn_for(model.filename(), content.clone(), Behavior::Complete).await;
+    let client = HFClient::builder()
+        .endpoint(hub.endpoint())
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    // Stand in for a transfer that stopped a quarter of the way through.
+    let target = dir.path().join(model.filename());
+    let already_have = 1024;
+    std::fs::write(partial_path_for(&target), &content[..already_have]).unwrap();
+
+    let path = download_model(&client, model, dir.path()).await.unwrap();
+
+    assert_eq!(std::fs::read(&path).unwrap(), content);
+    assert_eq!(hub.last_range().map(|(start, _)| start), Some(1024));
+    assert!(
+        !partial_path_for(&target).exists(),
+        "partial file left behind"
+    );
+}
+
+#[tokio::test]
+async fn partial_file_is_never_used_as_complete() {
+    let model = KnownModel::Qwen3Embedding06B;
+    let content = sample_content();
+    let hub = FakeHub::spawn_for(
+        model.filename(),
+        content.clone(),
+        Behavior::TruncateAfter(512),
+    )
+    .await;
+    let client = HFClient::builder()
+        .endpoint(hub.endpoint())
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join(model.filename());
+
+    let result = download_model(&client, model, dir.path()).await;
+
+    assert!(result.is_err(), "a short transfer must not report success");
+    assert!(
+        !target.exists(),
+        "an incomplete transfer must not land as the model file"
+    );
+    assert_eq!(
+        CacheEntry::inspect(ModelRole::Embedder, dir.path())
+            .unwrap()
+            .state,
+        CacheState::Partial { bytes: 512 }
+    );
 }
