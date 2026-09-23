@@ -140,7 +140,47 @@ pub async fn download_model(
 
     std::fs::rename(&partial, &target)
         .with_context(|| format!("rename into {}", target.display()))?;
+
+    let declared = declared_digest(client, model)
+        .await
+        .with_context(|| format!("read declared digest for {}", model.filename()))?;
+    verify_and_seal(&target, declared)?;
+
     Ok(target)
+}
+
+/// Hash a just-completed download and compare it against the digest the hub
+/// declared for it, recording the result as a sidecar on a match.
+///
+/// A sidecar is written only once the hash matches (FR-008a): a mismatch
+/// returns an error and leaves no sidecar, so the file stays on disk as
+/// `Unverified` for inspection rather than being trusted. A repository that
+/// declares no digest at all leaves the file unverified the same way, with
+/// no error, since there is nothing to check it against (FR-011a).
+fn verify_and_seal(target: &Path, declared_digest: Option<String>) -> Result<()> {
+    let Some(expected) = declared_digest else {
+        return Ok(());
+    };
+
+    let found = sha256_hex(target)?;
+    if !found.eq_ignore_ascii_case(&expected) {
+        return Err(markq_core::Error::ModelDigestMismatch {
+            path: target.to_path_buf(),
+            expected,
+            found,
+        }
+        .into());
+    }
+
+    let size_bytes = std::fs::metadata(target)
+        .with_context(|| format!("stat {}", target.display()))?
+        .len();
+    DigestSidecar {
+        digest: found,
+        size_bytes,
+        source: "hub lfs metadata".to_string(),
+    }
+    .write_for(target)
 }
 
 /// The digest the repository declares for this model's file, when it declares
@@ -587,6 +627,38 @@ mod tests {
         );
         assert_eq!(ModelRole::Embedder.as_str(), "embedder");
         assert_eq!(ModelRole::Reranker.as_str(), "reranker");
+    }
+
+    #[test]
+    fn digest_mismatch_refuses_and_writes_no_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("model.gguf");
+        std::fs::write(&target, b"hello").unwrap();
+
+        let wrong = "0000000000000000000000000000000000000000000000000000000000000000";
+        let err = verify_and_seal(&target, Some(wrong.to_string())).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("does not match"), "got: {message}");
+        assert!(
+            !DigestSidecar::path_for(&target).exists(),
+            "a mismatch must not leave a sidecar behind"
+        );
+    }
+
+    #[test]
+    fn successful_download_writes_sidecar_with_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("model.gguf");
+        std::fs::write(&target, b"hello").unwrap();
+        let good = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+        verify_and_seal(&target, Some(good.to_string())).unwrap();
+
+        let sidecar = DigestSidecar::read_for(&target)
+            .unwrap()
+            .expect("sidecar written after a matching hash");
+        assert_eq!(sidecar.digest, good);
+        assert_eq!(sidecar.size_bytes, 5);
     }
 
     #[test]
