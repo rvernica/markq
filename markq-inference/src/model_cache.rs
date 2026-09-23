@@ -79,9 +79,21 @@ pub async fn download_model(
     }
 
     if let Some(setting) = offline {
-        return Err(markq_core::Error::OfflineRefused {
-            role: role.as_str().to_string(),
-            setting: setting.to_string(),
+        // A file that is present but unverified is a different problem from one
+        // that was never fetched, and sending the user after a download they
+        // already have would waste their time.
+        let role_name = role.as_str().to_string();
+        let setting = setting.to_string();
+        return Err(if target.exists() {
+            markq_core::Error::OfflineVerificationRefused {
+                role: role_name,
+                setting,
+            }
+        } else {
+            markq_core::Error::OfflineRefused {
+                role: role_name,
+                setting,
+            }
         }
         .into());
     }

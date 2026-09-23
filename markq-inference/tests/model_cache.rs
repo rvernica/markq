@@ -301,3 +301,30 @@ async fn complete_cache_makes_no_request_with_offline_unset() {
         "a verified cache must not produce another request"
     );
 }
+
+#[tokio::test]
+async fn offline_refusal_distinguishes_present_from_absent() {
+    let model = KnownModel::Qwen3Embedding06B;
+    let hub = FakeHub::spawn_for(model.filename(), sample_content(), Behavior::Complete).await;
+    let client = HFClient::builder()
+        .endpoint(hub.endpoint())
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    // A file is there, it is simply not vouched for. Saying it is "not cached"
+    // would send the user looking for a download that already happened.
+    std::fs::write(dir.path().join(model.filename()), b"staged by an operator").unwrap();
+
+    let message = download_model(&client, model, dir.path(), Some("--offline"))
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        !message.contains("not cached"),
+        "the file is cached; message said: {message}"
+    );
+    assert!(message.contains("not verified"), "got: {message}");
+    assert!(message.contains("--offline"), "got: {message}");
+}

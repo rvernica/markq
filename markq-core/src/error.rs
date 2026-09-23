@@ -86,6 +86,11 @@ pub enum Error {
     )]
     OfflineRefused { role: String, setting: String },
 
+    #[error(
+        "the {role} model is present but not verified, and {setting} forbids contacting the repository to check it; run `markq models pull {role}` with network access"
+    )]
+    OfflineVerificationRefused { role: String, setting: String },
+
     #[error("model directory {path:?} cannot be used: {reason}")]
     ModelsDirUnusable { path: PathBuf, reason: String },
 
