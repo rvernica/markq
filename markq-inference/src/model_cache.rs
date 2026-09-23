@@ -448,6 +448,30 @@ pub fn models_dir() -> PathBuf {
     p
 }
 
+/// Refuse to load a cached file whose size disagrees with its sidecar
+/// (FR-006a). This is a size comparison only, run on every load, never a
+/// hash: hashing the cache on every load would make loading as slow as a
+/// fresh verification. A file with no sidecar (a pre-staged file, FR-011a)
+/// passes through unchecked, since there is nothing recorded to compare
+/// against.
+fn check_cached_size(path: &Path) -> Result<()> {
+    let Some(sidecar) = DigestSidecar::read_for(path)? else {
+        return Ok(());
+    };
+    let found = std::fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    if found != sidecar.size_bytes {
+        return Err(markq_core::Error::ModelSizeMismatch {
+            path: path.to_path_buf(),
+            expected: sidecar.size_bytes,
+            found,
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// Resolve a `KnownModel` to a local path, downloading if absent.
 ///
 /// Downloads run on the current tokio runtime (the CLI's `#[tokio::main]`).
@@ -460,6 +484,7 @@ pub async fn ensure_model(model: KnownModel) -> Result<PathBuf> {
 
     let expected_path = local_dir.join(filename);
     if expected_path.exists() {
+        check_cached_size(&expected_path)?;
         info!(path = %expected_path.display(), "model already cached");
         return Ok(expected_path);
     }
@@ -698,6 +723,45 @@ mod tests {
             .expect("sidecar written after a matching hash");
         assert_eq!(sidecar.digest, good);
         assert_eq!(sidecar.size_bytes, 5);
+    }
+
+    #[test]
+    fn truncated_model_is_refused_before_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model.gguf");
+        std::fs::write(&model, b"hello").unwrap(); // 5 bytes on disk
+
+        DigestSidecar {
+            digest: "abc".into(),
+            size_bytes: 10, // the sidecar recorded a larger, complete file
+            source: "hub lfs metadata".into(),
+        }
+        .write_for(&model)
+        .unwrap();
+
+        let err = check_cached_size(&model).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("model.gguf"), "got: {message}");
+    }
+
+    #[test]
+    fn load_does_not_hash_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model.gguf");
+        std::fs::write(&model, b"hello").unwrap();
+
+        // A digest that could never match this file's real hash. If the
+        // load path hashed the file and compared it, this would fail; it
+        // passes because the load path checks size only (FR-006a).
+        DigestSidecar {
+            digest: "not-a-real-sha256".into(),
+            size_bytes: 5,
+            source: "hub lfs metadata".into(),
+        }
+        .write_for(&model)
+        .unwrap();
+
+        check_cached_size(&model).expect("a size-only check must not hash the file");
     }
 
     #[test]
