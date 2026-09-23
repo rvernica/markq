@@ -6,8 +6,6 @@
 //! carries the LFS digest. Requests are counted so a test can assert that no
 //! request was made at all.
 
-#![allow(dead_code)]
-
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -31,6 +29,8 @@ pub enum Behavior {
     NotFound,
     /// Omit the LFS block from the tree listing, so no digest is declared.
     NoDeclaredDigest,
+    /// Declare a digest that does not match the content actually served.
+    WrongDeclaredDigest,
 }
 
 pub struct FakeHub {
@@ -214,10 +214,13 @@ async fn serve(
 /// The subset of the tree listing the digest lookup reads: one file entry whose
 /// `lfs.sha256` is the declared digest.
 fn tree_listing(digest: &str, filename: &str, size: usize, behavior: Behavior) -> String {
-    let lfs = if behavior == Behavior::NoDeclaredDigest {
-        String::new()
-    } else {
-        format!(",\"lfs\":{{\"sha256\":\"{digest}\",\"size\":{size},\"pointerSize\":134}}")
+    let lfs = match behavior {
+        Behavior::NoDeclaredDigest => String::new(),
+        Behavior::WrongDeclaredDigest => {
+            let wrong = "0".repeat(64);
+            format!(",\"lfs\":{{\"sha256\":\"{wrong}\",\"size\":{size},\"pointerSize\":134}}")
+        }
+        _ => format!(",\"lfs\":{{\"sha256\":\"{digest}\",\"size\":{size},\"pointerSize\":134}}"),
     };
     format!(
         "[{{\"type\":\"file\",\"oid\":\"{digest}\",\"path\":\"{filename}\",\"size\":{size}{lfs}}}]"

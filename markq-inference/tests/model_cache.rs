@@ -1,14 +1,12 @@
 //! Model cache behavior against a local stand-in for the hub.
 
-mod support;
-
 use fs4::FileExt;
 use hf_hub::HFClient;
 use markq_inference::model_cache::{
     declared_digest, download_model, lock_path_for, partial_path_for, CacheEntry, CacheState,
     KnownModel, ModelRole,
 };
-use support::{Behavior, FakeHub};
+use markq_test_support::{Behavior, FakeHub};
 
 fn sample_content() -> Vec<u8> {
     (0..4096_u32).map(|byte| (byte % 251) as u8).collect()

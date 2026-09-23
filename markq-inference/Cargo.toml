@@ -34,8 +34,6 @@ default = []
 vulkan = ["llama-cpp-2/vulkan"]
 cuda = ["llama-cpp-2/cuda"]
 
-# The hub stand-in in `tests/support` needs a TCP listener and async byte IO;
-# cargo features are additive, so this widens tokio for tests only.
 [dev-dependencies]
+markq-test-support.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["net", "io-util"] }

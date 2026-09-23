@@ -1,12 +1,10 @@
 //! `markq models pull` / `markq models ls` against a local stand-in for the
 //! hub, so these tests never touch the network.
 
-mod support;
-
 use markq_cli::models::{ls_rows, run_pull};
 use markq_inference::model_cache::{DigestSidecar, KnownModel, ModelRole};
 use markq_inference::HFClient;
-use support::{Behavior, FakeHub};
+use markq_test_support::{Behavior, FakeHub};
 
 fn sample_content() -> Vec<u8> {
     (0..4096_u32).map(|byte| (byte % 251) as u8).collect()
