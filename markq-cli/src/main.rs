@@ -452,7 +452,7 @@ async fn cmd_rerank(args: &RerankArgs) -> Result<()> {
 async fn cmd_models(cmd: ModelsCmd, offline: Option<&str>) -> Result<()> {
     match cmd {
         ModelsCmd::Pull { role } => {
-            let models_dir = markq_inference::models_dir();
+            let models_dir = markq_inference::models_dir()?;
             let client = markq_inference::HFClient::new().context("HFClient::new")?;
             let outcomes = models::run_pull(role.as_deref(), &models_dir, &client, offline).await?;
 
@@ -481,7 +481,7 @@ async fn cmd_models(cmd: ModelsCmd, offline: Option<&str>) -> Result<()> {
             Ok(())
         }
         ModelsCmd::Ls { json } => {
-            let models_dir = markq_inference::models_dir();
+            let models_dir = markq_inference::models_dir()?;
             let rows = models::ls_rows(&models_dir)?;
             if json {
                 serde_json::to_writer_pretty(std::io::stdout(), &rows)?;
@@ -506,7 +506,7 @@ async fn cmd_models(cmd: ModelsCmd, offline: Option<&str>) -> Result<()> {
 }
 
 async fn cmd_doctor(dataset_path: &std::path::Path, args: &DoctorArgs) -> Result<()> {
-    let models_dir = markq_inference::models_dir();
+    let models_dir = markq_inference::models_dir()?;
     let findings = markq_cli::doctor::run_doctor(dataset_path, &models_dir, args.verify).await?;
 
     if args.json {

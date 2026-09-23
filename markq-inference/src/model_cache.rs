@@ -486,14 +486,49 @@ impl std::str::FromStr for ModelRole {
 /// then falls back to `$XDG_CACHE_HOME/markq/models`, then `~/.cache/markq/
 /// models`, then `./markq/models` if no cache dir can be resolved (containers,
 /// CI without `$HOME`).
-pub fn models_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("MARKQ_MODELS_DIR") {
-        return PathBuf::from(p);
+/// Resolve the models directory, validating an override the user supplied.
+///
+/// An override has to already be there. Pointing at a staged directory that is
+/// missing or unreadable is a typo or a permissions problem, and silently
+/// falling back to the default would leave the user looking at an empty cache
+/// wondering where their models went. The default location is returned as-is,
+/// since not existing yet is its normal first-run state.
+pub fn resolve_models_dir(override_value: Option<&str>) -> markq_core::Result<PathBuf> {
+    let Some(value) = override_value else {
+        return Ok(default_models_dir());
+    };
+
+    let path = PathBuf::from(value);
+    let metadata =
+        std::fs::metadata(&path).map_err(|source| markq_core::Error::ModelsDirUnusable {
+            path: path.clone(),
+            reason: source.to_string(),
+        })?;
+    if !metadata.is_dir() {
+        return Err(markq_core::Error::ModelsDirUnusable {
+            path,
+            reason: "not a directory".to_string(),
+        });
     }
+    std::fs::read_dir(&path).map_err(|source| markq_core::Error::ModelsDirUnusable {
+        path: path.clone(),
+        reason: format!("unreadable: {source}"),
+    })?;
+
+    Ok(path)
+}
+
+/// The cache location markq uses when nothing overrides it.
+fn default_models_dir() -> PathBuf {
     let mut p = dirs::cache_dir().unwrap_or_else(|| PathBuf::from("."));
     p.push("markq");
     p.push("models");
     p
+}
+
+/// The models directory for this process, honoring `MARKQ_MODELS_DIR`.
+pub fn models_dir() -> markq_core::Result<PathBuf> {
+    resolve_models_dir(std::env::var("MARKQ_MODELS_DIR").ok().as_deref())
 }
 
 /// Refuse to load a cached file whose size disagrees with its sidecar
@@ -526,7 +561,7 @@ fn check_cached_size(path: &Path) -> Result<()> {
 pub async fn ensure_model(model: KnownModel) -> Result<PathBuf> {
     let (owner, name) = model.repo();
     let filename = model.filename();
-    let local_dir = models_dir();
+    let local_dir = models_dir()?;
     std::fs::create_dir_all(&local_dir)
         .with_context(|| format!("create models dir {}", local_dir.display()))?;
 
@@ -629,6 +664,46 @@ mod tests {
         assert!(
             msg.contains(good),
             "error should report actual digest: {msg}"
+        );
+    }
+
+    #[test]
+    fn missing_models_dir_errors_naming_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("staged-models");
+
+        let error = resolve_models_dir(Some(absent.to_str().unwrap())).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("staged-models"), "got: {message}");
+    }
+
+    #[test]
+    fn unreadable_models_dir_does_not_fall_back_to_default() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // A path that is a file, not a directory.
+        let as_file = dir.path().join("not-a-directory");
+        std::fs::write(&as_file, b"").unwrap();
+        let error = resolve_models_dir(Some(as_file.to_str().unwrap())).unwrap_err();
+        assert!(
+            error.to_string().contains("not-a-directory"),
+            "got: {error}"
+        );
+
+        // A directory the process cannot read.
+        let sealed = dir.path().join("sealed");
+        std::fs::create_dir(&sealed).unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = resolve_models_dir(Some(sealed.to_str().unwrap()));
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = result.expect_err("an unreadable directory must not be accepted");
+        assert!(error.to_string().contains("sealed"), "got: {error}");
+        assert!(
+            error.to_string().contains("unreadable"),
+            "the reason should say what is wrong: {error}"
         );
     }
 
@@ -826,7 +901,7 @@ mod tests {
         let filename = KnownModel::Qwen3Reranker06B.filename();
         assert_eq!(filename, "qwen3-reranker-0.6b-q8_0.gguf");
 
-        let cache_path = models_dir().join(filename);
+        let cache_path = models_dir().unwrap().join(filename);
         let cache_path_str = cache_path.to_string_lossy();
         assert!(
             cache_path_str.ends_with("markq/models/qwen3-reranker-0.6b-q8_0.gguf"),
