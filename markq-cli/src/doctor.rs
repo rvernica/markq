@@ -291,14 +291,15 @@ fn check_model(
                 "cached and verified",
                 format!("run `markq models pull {}` to fetch it", role.as_str()),
             ),
+            // An unfinished transfer looks the same here whether it was
+            // interrupted or discarded for failing its digest check, so this
+            // says what is on disk rather than asserting a cause. Either way
+            // `models pull` is the command that finishes it.
             CacheState::Partial { bytes } => Diagnostic::warning(
                 &check,
-                format!("incomplete download ({bytes} byte(s) so far)"),
+                format!("an unfinished transfer ({bytes} byte(s) on disk)"),
                 "a complete, verified file",
-                format!(
-                    "run `markq models pull {}` to resume the download",
-                    role.as_str()
-                ),
+                format!("run `markq models pull {}` to finish it", role.as_str()),
             ),
             CacheState::Unverified => match &sidecar {
                 Some(record) => Diagnostic::error(
