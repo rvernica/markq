@@ -74,7 +74,7 @@ enum Command {
     /// Reclaim space from tombstoned chunks.
     Compact,
     /// Diagnose index, model, and dimension issues.
-    Doctor,
+    Doctor(DoctorArgs),
     /// Manage the GGUF model cache.
     #[command(subcommand)]
     Models(ModelsCmd),
@@ -191,6 +191,17 @@ struct WatchArgs {
     collection: Option<String>,
 }
 
+#[derive(Args, Debug)]
+struct DoctorArgs {
+    #[arg(long)]
+    json: bool,
+    /// Also compute each cached model's full digest, catching a same-length
+    /// alteration the default size-only check can't see. Slower than the
+    /// default run.
+    #[arg(long)]
+    verify: bool,
+}
+
 #[derive(Subcommand, Debug)]
 enum CollectionCmd {
     Add {
@@ -237,6 +248,7 @@ async fn main() -> Result<()> {
         Command::Query(args) => cmd_query(&dataset_path, &args).await,
         Command::Rerank(args) => cmd_rerank(&args).await,
         Command::Models(cmd) => cmd_models(cmd).await,
+        Command::Doctor(args) => cmd_doctor(&dataset_path, &args).await,
 
         // Every other v1 subcommand has its name + arg shape registered now
         // so `markq --help` matches the final surface; their bodies land
@@ -246,7 +258,6 @@ async fn main() -> Result<()> {
         | Command::Get(_)
         | Command::MultiGet(_)
         | Command::Compact
-        | Command::Doctor
         | Command::Watch(_)
         | Command::Serve
         | Command::Status
@@ -446,6 +457,31 @@ async fn cmd_models(cmd: ModelsCmd) -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn cmd_doctor(dataset_path: &std::path::Path, args: &DoctorArgs) -> Result<()> {
+    let models_dir = markq_inference::models_dir();
+    let findings = markq_cli::doctor::run_doctor(dataset_path, &models_dir, args.verify).await?;
+
+    if args.json {
+        serde_json::to_writer_pretty(std::io::stdout(), &findings)?;
+        println!();
+    } else {
+        for f in &findings {
+            println!("[{:<7}] {:<24} {}", f.severity, f.check, f.next_step);
+            if let Some(observed) = &f.observed {
+                println!("          observed: {observed}");
+            }
+            if let Some(expected) = &f.expected {
+                println!("          expected: {expected}");
+            }
+        }
+    }
+
+    if markq_cli::doctor::any_error(&findings) {
+        anyhow::bail!("doctor found one or more error-severity findings");
+    }
+    Ok(())
 }
 
 async fn cmd_search(dataset_path: &std::path::Path, args: &QueryArgs) -> Result<()> {

@@ -104,6 +104,22 @@ pub fn any_error(findings: &[Diagnostic]) -> bool {
     findings.iter().any(|f| f.severity == Severity::Error)
 }
 
+/// The complete `markq doctor` pass: dataset checks (presence, schema
+/// version, embedder identity, index coverage) followed by every known
+/// role's model-cache check. Read-only throughout (FR-025) and never loads a
+/// model (FR-020); works whether or not the dataset has ever been created
+/// (FR-023) and requires no network access (FR-022), since every check reads
+/// only local state.
+pub async fn run_doctor(
+    dataset_path: &Path,
+    models_dir: &Path,
+    verify: bool,
+) -> anyhow::Result<Vec<Diagnostic>> {
+    let mut findings = check_dataset(dataset_path).await?;
+    findings.extend(check_models(models_dir, verify)?);
+    Ok(findings)
+}
+
 /// Dataset presence, schema version, and embedder identity (FR-018, FR-023).
 /// Never creates a dataset (FR-025): a path that does not exist is reported
 /// as uninitialized rather than opened via a creating call.
@@ -342,6 +358,8 @@ fn check_model(
 mod tests {
     use super::*;
     use markq_core::{DatasetMetadata, IndexCoverage, SCHEMA_VERSION};
+    use markq_inference::model_cache::{lock_path_for, partial_path_for};
+    use markq_inference::sha256_hex;
 
     #[tokio::test]
     async fn uninitialized_dataset_is_not_an_error() {
@@ -389,12 +407,7 @@ mod tests {
             lance_manifest_version: 1,
             lance_file_format_version: "2.1".to_string(),
             lancedb_crate_version: "0.27.2".to_string(),
-            embedder_model: Some(
-                markq_inference::model_cache::ModelRole::Embedder
-                    .known_model()
-                    .id()
-                    .to_string(),
-            ),
+            embedder_model: Some(ModelRole::Embedder.known_model().id().to_string()),
             embedder_dim: Some(4),
         };
 
@@ -488,11 +501,7 @@ mod tests {
         let model_path = dir
             .path()
             .join(ModelRole::Embedder.known_model().filename());
-        std::fs::write(
-            markq_inference::model_cache::partial_path_for(&model_path),
-            b"0123456789",
-        )
-        .unwrap();
+        std::fs::write(partial_path_for(&model_path), b"0123456789").unwrap();
 
         let findings = check_model(ModelRole::Embedder, dir.path(), false).unwrap();
 
@@ -511,7 +520,7 @@ mod tests {
         let model_path = dir
             .path()
             .join(ModelRole::Embedder.known_model().filename());
-        markq_inference::model_cache::DigestSidecar {
+        DigestSidecar {
             digest: "abc".into(),
             size_bytes: 5,
             source: "hub lfs metadata".into(),
@@ -537,15 +546,15 @@ mod tests {
             .join(ModelRole::Embedder.known_model().filename());
         let content = b"hello";
         std::fs::write(&model_path, content).unwrap();
-        markq_inference::model_cache::DigestSidecar {
-            digest: markq_inference::sha256_hex(&model_path).unwrap(),
+        DigestSidecar {
+            digest: sha256_hex(&model_path).unwrap(),
             size_bytes: content.len() as u64,
             source: "hub lfs metadata".into(),
         }
         .write_for(&model_path)
         .unwrap();
 
-        let lock_path = markq_inference::model_cache::lock_path_for(&model_path);
+        let lock_path = lock_path_for(&model_path);
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -584,8 +593,8 @@ mod tests {
             .join(ModelRole::Embedder.known_model().filename());
         let content = b"hello";
         std::fs::write(&model_path, content).unwrap();
-        markq_inference::model_cache::DigestSidecar {
-            digest: markq_inference::sha256_hex(&model_path).unwrap(),
+        DigestSidecar {
+            digest: sha256_hex(&model_path).unwrap(),
             size_bytes: content.len() as u64,
             source: "hub lfs metadata".into(),
         }
@@ -593,11 +602,7 @@ mod tests {
         .unwrap();
         // A lock file left on disk (e.g. by a process that exited normally)
         // but not currently held by anyone.
-        std::fs::write(
-            markq_inference::model_cache::lock_path_for(&model_path),
-            b"",
-        )
-        .unwrap();
+        std::fs::write(lock_path_for(&model_path), b"").unwrap();
 
         let findings = check_model(ModelRole::Embedder, dir.path(), false).unwrap();
 
@@ -617,8 +622,8 @@ mod tests {
             .join(ModelRole::Embedder.known_model().filename());
         let original = b"hello";
         std::fs::write(&model_path, original).unwrap();
-        markq_inference::model_cache::DigestSidecar {
-            digest: markq_inference::sha256_hex(&model_path).unwrap(),
+        DigestSidecar {
+            digest: sha256_hex(&model_path).unwrap(),
             size_bytes: original.len() as u64,
             source: "hub lfs metadata".into(),
         }
@@ -651,8 +656,8 @@ mod tests {
             .join(ModelRole::Embedder.known_model().filename());
         let original = b"hello";
         std::fs::write(&model_path, original).unwrap();
-        markq_inference::model_cache::DigestSidecar {
-            digest: markq_inference::sha256_hex(&model_path).unwrap(),
+        DigestSidecar {
+            digest: sha256_hex(&model_path).unwrap(),
             size_bytes: original.len() as u64,
             source: "hub lfs metadata".into(),
         }
