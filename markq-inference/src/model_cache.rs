@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use hf_hub::HFClient;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::info;
 
@@ -49,6 +50,65 @@ impl KnownModel {
             KnownModel::Qwen3Embedding06B => "Qwen/Qwen3-Embedding-0.6B-GGUF/Q8_0",
             KnownModel::Qwen3Reranker06B => "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/Q8_0",
         }
+    }
+}
+
+/// What a verified download records next to its model file, so a later run can
+/// re-check the file without asking the hub what "correct" means. It travels
+/// with the directory when an operator copies a staged cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DigestSidecar {
+    /// Lowercase hex SHA-256 of the verified file.
+    pub digest: String,
+    /// Size of the verified file, which is what the per-load check compares.
+    pub size_bytes: u64,
+    /// Where the digest came from, so a later disagreement is attributable.
+    pub source: String,
+}
+
+impl DigestSidecar {
+    /// The sidecar path for a model file.
+    pub fn path_for(model_path: &Path) -> PathBuf {
+        let mut name = model_path.as_os_str().to_os_string();
+        name.push(".digest.json");
+        PathBuf::from(name)
+    }
+
+    /// Read the sidecar beside `model_path`, if one is there. A sidecar that
+    /// cannot be parsed is an error rather than a silent absence: it means
+    /// something wrote the file, and treating that as "no record" would hide
+    /// the problem behind a re-download.
+    pub fn read_for(model_path: &Path) -> Result<Option<Self>> {
+        let path = Self::path_for(model_path);
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => {
+                let sidecar = serde_json::from_str(&raw)
+                    .with_context(|| format!("parse digest sidecar {}", path.display()))?;
+                Ok(Some(sidecar))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
+        }
+    }
+
+    /// Write the sidecar beside `model_path` by rename, so a reader never sees
+    /// a half-written record.
+    pub fn write_for(&self, model_path: &Path) -> Result<()> {
+        let path = Self::path_for(model_path);
+        let mut temporary = path.clone();
+        temporary.set_extension("tmp");
+        let encoded = serde_json::to_vec_pretty(self).context("encode digest sidecar")?;
+        std::fs::write(&temporary, encoded)
+            .with_context(|| format!("write {}", temporary.display()))?;
+        std::fs::rename(&temporary, &path)
+            .with_context(|| format!("rename into {}", path.display()))?;
+        Ok(())
+    }
+
+    /// A sidecar whose model file is gone describes nothing, and must not let a
+    /// later download skip its own verification.
+    pub fn is_stale_for(model_path: &Path) -> bool {
+        Self::path_for(model_path).exists() && !model_path.exists()
     }
 }
 
@@ -225,6 +285,44 @@ mod tests {
             msg.contains(good),
             "error should report actual digest: {msg}"
         );
+    }
+
+    #[test]
+    fn sidecar_round_trips_digest_size_and_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model.gguf");
+        std::fs::write(&model, b"hello").unwrap();
+
+        let written = DigestSidecar {
+            digest: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".into(),
+            size_bytes: 5,
+            source: "hub lfs metadata".into(),
+        };
+        written.write_for(&model).unwrap();
+
+        let read = DigestSidecar::read_for(&model)
+            .unwrap()
+            .expect("sidecar present");
+        assert_eq!(read, written);
+    }
+
+    #[test]
+    fn sidecar_without_its_model_file_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model.gguf");
+        std::fs::write(&model, b"hello").unwrap();
+        DigestSidecar {
+            digest: "abc".into(),
+            size_bytes: 5,
+            source: "hub lfs metadata".into(),
+        }
+        .write_for(&model)
+        .unwrap();
+
+        assert!(!DigestSidecar::is_stale_for(&model));
+
+        std::fs::remove_file(&model).unwrap();
+        assert!(DigestSidecar::is_stale_for(&model));
     }
 
     #[test]
