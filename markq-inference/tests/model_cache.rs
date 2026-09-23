@@ -328,3 +328,26 @@ async fn offline_refusal_distinguishes_present_from_absent() {
     assert!(message.contains("not verified"), "got: {message}");
     assert!(message.contains("--offline"), "got: {message}");
 }
+
+#[tokio::test]
+async fn a_server_that_ignores_the_range_does_not_produce_a_longer_file() {
+    let model = KnownModel::Qwen3Embedding06B;
+    let content = sample_content();
+    let hub = FakeHub::spawn_for(model.filename(), content.clone(), Behavior::IgnoreRange).await;
+    let client = HFClient::builder()
+        .endpoint(hub.endpoint())
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join(model.filename());
+
+    // A transfer stopped a quarter of the way through, against a server that
+    // will answer the resume request with the whole file.
+    std::fs::write(partial_path_for(&target), &content[..1024]).unwrap();
+
+    let path = download_model(&client, model, dir.path(), None)
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read(&path).unwrap(), content);
+}

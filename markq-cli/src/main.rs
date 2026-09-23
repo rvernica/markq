@@ -23,14 +23,23 @@ const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (backend: cuda)");
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (backend: cpu)");
 
 /// Render a byte count the way a person reads a model file's size.
+///
+/// Small units matter here because the size column also carries the progress of
+/// an unfinished transfer, where rounding everything under a mebibyte to
+/// `0 MiB` would hide the difference between stalled and starting.
 fn human_size(bytes: u64) -> String {
-    const MIB: f64 = 1024.0 * 1024.0;
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
     const GIB: f64 = MIB * 1024.0;
-    let bytes = bytes as f64;
-    if bytes >= GIB {
-        format!("{:.1} GiB", bytes / GIB)
+    let value = bytes as f64;
+    if value >= GIB {
+        format!("{:.1} GiB", value / GIB)
+    } else if value >= MIB {
+        format!("{:.0} MiB", value / MIB)
+    } else if value >= KIB {
+        format!("{:.0} KiB", value / KIB)
     } else {
-        format!("{:.0} MiB", bytes / MIB)
+        format!("{bytes} B")
     }
 }
 

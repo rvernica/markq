@@ -96,12 +96,18 @@ pub fn state_label(state: &CacheState) -> &'static str {
 impl ModelRow {
     fn from_entry(entry: CacheEntry) -> Self {
         let state = state_label(&entry.state).to_string();
+        // An unfinished transfer has no model file to stat, but its progress is
+        // the number a user watching a stalled download wants.
+        let size_bytes = match entry.state {
+            CacheState::Partial { bytes } => Some(bytes),
+            _ => entry.size_bytes,
+        };
         Self {
             role: entry.role.as_str().to_string(),
             model_id: entry.role.known_model().id().to_string(),
             filename: entry.role.known_model().filename().to_string(),
             state,
-            size_bytes: entry.size_bytes,
+            size_bytes,
             digest: entry.digest,
             digest_source: entry.digest_source,
         }
@@ -124,6 +130,26 @@ pub fn ls_rows(models_dir: &Path) -> Result<Vec<ModelRow>> {
 mod tests {
     use super::*;
     use markq_inference::model_cache::{DigestSidecar, KnownModel};
+
+    #[test]
+    fn ls_reports_progress_for_an_unfinished_transfer() {
+        let dir = tempfile::tempdir().unwrap();
+        let role = ModelRole::Embedder;
+        let target = dir.path().join(role.known_model().filename());
+        std::fs::write(
+            markq_inference::model_cache::partial_path_for(&target),
+            vec![0_u8; 4096],
+        )
+        .unwrap();
+
+        let rows = ls_rows(dir.path()).unwrap();
+        let row = rows.iter().find(|row| row.role == "embedder").unwrap();
+
+        assert_eq!(row.state, "partial");
+        // Without this a user watching a stalled download cannot tell one
+        // megabyte from six hundred.
+        assert_eq!(row.size_bytes, Some(4096));
+    }
 
     #[test]
     fn ls_lists_every_role_including_absent_ones() {

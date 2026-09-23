@@ -157,7 +157,7 @@ pub async fn download_model(
     }
 
     let range = if have > 0 { Some(have..total) } else { None };
-    let (_, mut stream) = repo
+    let (content_length, mut stream) = repo
         .download_file_stream()
         .filename(model.filename())
         .maybe_range(range)
@@ -165,9 +165,28 @@ pub async fn download_model(
         .await
         .with_context(|| format!("fetch {owner}/{name}/{}", model.filename()))?;
 
-    let mut sink = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+    // A server that does not implement ranges answers with the whole file.
+    // Appending that to what is already on disk would build a file longer than
+    // the original, so the transfer starts over instead.
+    let honored_range =
+        have == 0 || content_length.is_some_and(|length| length == total.saturating_sub(have));
+    if !honored_range {
+        warn!(
+            path = %partial.display(),
+            have,
+            total,
+            "the repository ignored the resume request, so the transfer restarts"
+        );
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true);
+    if honored_range && have > 0 {
+        options.append(true);
+    } else {
+        options.truncate(true);
+    }
+    let mut sink = options
         .open(&partial)
         .with_context(|| format!("open {}", partial.display()))?;
     while let Some(chunk) = stream.next().await {

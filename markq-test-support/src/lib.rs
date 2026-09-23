@@ -31,6 +31,9 @@ pub enum Behavior {
     NoDeclaredDigest,
     /// Declare a digest that does not match the content actually served.
     WrongDeclaredDigest,
+    /// Answer a ranged request with the whole file, as a proxy or mirror that
+    /// does not implement ranges would.
+    IgnoreRange,
 }
 
 pub struct FakeHub {
@@ -170,7 +173,10 @@ async fn serve(
         return write_head(&mut stream, 200, "OK", &headers).await;
     }
 
-    let requested = parse_range(&request);
+    let requested = match parse_range(&request) {
+        Some(_) if behavior == Behavior::IgnoreRange => None,
+        other => other,
+    };
     if let Some((start, end)) = requested {
         *ranges.lock().unwrap() = Some((start as u64, end.map(|value| value as u64)));
     }
