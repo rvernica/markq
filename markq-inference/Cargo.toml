@@ -16,6 +16,7 @@ markq-core.workspace = true
 llama-cpp-2.workspace = true
 hf-hub.workspace = true
 crossbeam-channel.workspace = true
+fs4.workspace = true
 sha2.workspace = true
 hex.workspace = true
 once_cell.workspace = true

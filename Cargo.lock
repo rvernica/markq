@@ -3770,6 +3770,7 @@ dependencies = [
  "anyhow",
  "crossbeam-channel",
  "dirs",
+ "fs4",
  "hex",
  "hf-hub",
  "llama-cpp-2",
