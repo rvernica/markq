@@ -10,7 +10,7 @@ use markq_core::{default_dataset_path, Index};
 use markq_index_lance::LanceIndex;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use markq_cli::{embed_query, embedder_cmd, indexer, query, rerank, search, vsearch};
+use markq_cli::{embed_query, embedder_cmd, indexer, models, query, rerank, search, vsearch};
 
 /// Version string with the compiled-in inference backend appended, so
 /// `markq --version` reveals whether GPU offload is available without
@@ -231,6 +231,7 @@ async fn main() -> Result<()> {
         Command::Vsearch(args) => cmd_vsearch(&dataset_path, &args).await,
         Command::Query(args) => cmd_query(&dataset_path, &args).await,
         Command::Rerank(args) => cmd_rerank(&args).await,
+        Command::Models(cmd) => cmd_models(cmd).await,
 
         // Every other v1 subcommand has its name + arg shape registered now
         // so `markq --help` matches the final surface; their bodies land
@@ -241,7 +242,6 @@ async fn main() -> Result<()> {
         | Command::MultiGet(_)
         | Command::Compact
         | Command::Doctor
-        | Command::Models(_)
         | Command::Watch(_)
         | Command::Serve
         | Command::Status
@@ -385,6 +385,41 @@ async fn cmd_rerank(args: &RerankArgs) -> Result<()> {
         args.json,
     )
     .await
+}
+
+async fn cmd_models(cmd: ModelsCmd) -> Result<()> {
+    match cmd {
+        ModelsCmd::Pull { role } => {
+            let models_dir = markq_inference::models_dir();
+            let client = markq_inference::HFClient::new().context("HFClient::new")?;
+            let outcomes = models::run_pull(role.as_deref(), &models_dir, &client).await?;
+
+            let mut any_failed = false;
+            for outcome in &outcomes {
+                match &outcome.result {
+                    Ok(entry) => println!(
+                        "{}: ready ({:?}{})",
+                        outcome.role.as_str(),
+                        entry.state,
+                        if outcome.transferred {
+                            ", fetched"
+                        } else {
+                            ", already cached"
+                        }
+                    ),
+                    Err(message) => {
+                        any_failed = true;
+                        println!("{}: failed: {message}", outcome.role.as_str());
+                    }
+                }
+            }
+            if any_failed {
+                anyhow::bail!("not every requested model could be made ready");
+            }
+            Ok(())
+        }
+        ModelsCmd::Ls => anyhow::bail!("not implemented yet"),
+    }
 }
 
 async fn cmd_search(dataset_path: &std::path::Path, args: &QueryArgs) -> Result<()> {

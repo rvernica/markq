@@ -39,3 +39,8 @@ cuda = ["markq-inference/cuda"]
 
 [dev-dependencies]
 tempfile.workspace = true
+hex.workspace = true
+sha2.workspace = true
+# The hub stand-in in `tests/support` needs a TCP listener and async byte IO;
+# cargo features are additive, so this widens tokio for tests only.
+tokio = { workspace = true, features = ["net", "io-util"] }
