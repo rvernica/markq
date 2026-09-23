@@ -29,6 +29,26 @@ pub struct ChunkHit {
     pub score: f32,
 }
 
+/// One index's coverage against the dataset's current row count.
+/// Backend-neutral: `column` is the chunk-schema column it covers (e.g.
+/// `text`, `embedding`), never a backend's generated index name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexCoverage {
+    pub column: String,
+    pub indexed_rows: u64,
+    pub unindexed_rows: u64,
+}
+
+/// Backend-neutral index health report, returned by [`Index::health`].
+/// A column with no entry in `indexes` has no index built for it yet; that
+/// absence, rather than a boolean flag, is how "index missing" is
+/// represented (data-model.md `IndexHealth`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexHealth {
+    pub row_count: u64,
+    pub indexes: Vec<IndexCoverage>,
+}
+
 /// Backend-agnostic index contract.
 ///
 /// All retrieval methods take `collection: Option<&str>` so v1.5 multi-
@@ -99,4 +119,9 @@ pub trait Index: Send + Sync {
     /// Reclaim space from tombstoned rows and rebuild fragmented indexes.
     /// The threshold logic is not yet wired.
     async fn compact(&self) -> Result<()>;
+
+    /// Report row count and per-column index coverage, without scanning row
+    /// contents (FR-018b, `markq doctor`'s read-only budget). Reads index
+    /// counts and presence only.
+    async fn health(&self) -> Result<IndexHealth>;
 }

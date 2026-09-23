@@ -78,4 +78,14 @@ pub async fn run_contract<I: Index>(idx: &I) {
 
     // Compact on an empty index is a no-op.
     idx.compact().await.expect("compact");
+
+    // health() reports row count and per-column index coverage without
+    // scanning row contents. A freshly-opened backend has no rows and no
+    // index built yet, so coverage is empty rather than a false "present".
+    let health = idx.health().await.expect("health");
+    assert_eq!(health.row_count, 0);
+    assert!(
+        health.indexes.is_empty(),
+        "a fresh backend has no index built yet"
+    );
 }
