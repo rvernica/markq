@@ -7,6 +7,8 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
+use futures::StreamExt;
+use hf_hub::repository::files::RepoTreeEntry;
 use hf_hub::HFClient;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -51,6 +53,33 @@ impl KnownModel {
             KnownModel::Qwen3Reranker06B => "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/Q8_0",
         }
     }
+}
+
+/// The digest the repository declares for this model's file, when it declares
+/// one. This is what a download is checked against; a repository that declares
+/// nothing leaves the file unverifiable rather than untrusted.
+pub async fn declared_digest(client: &HFClient, model: KnownModel) -> Result<Option<String>> {
+    let (owner, name) = model.repo();
+    let repo = client.model(owner, name);
+    let wanted = model.filename();
+
+    let entries = repo
+        .list_tree()
+        .expand(true)
+        .send()
+        .with_context(|| format!("list {owner}/{name}"))?;
+    let mut entries = Box::pin(entries);
+
+    while let Some(entry) = entries.next().await {
+        let entry = entry.with_context(|| format!("read tree entry from {owner}/{name}"))?;
+        if let RepoTreeEntry::File { path, lfs, .. } = entry {
+            if path == wanted {
+                return Ok(lfs.and_then(|info| info.sha256));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 /// Where an in-flight transfer accumulates bytes. Kept beside the model file so

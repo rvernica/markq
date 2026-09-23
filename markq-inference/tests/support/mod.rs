@@ -33,6 +33,7 @@ pub struct FakeHub {
     endpoint: String,
     content: Vec<u8>,
     sha256: String,
+    filename: String,
     requests: Arc<AtomicUsize>,
 }
 
@@ -43,6 +44,12 @@ impl FakeHub {
     }
 
     pub async fn spawn_with(content: Vec<u8>, behavior: Behavior) -> Self {
+        Self::spawn_for("model.gguf", content, behavior).await
+    }
+
+    /// Start a hub whose tree listing advertises `filename`, so a caller that
+    /// looks the file up by name finds it.
+    pub async fn spawn_for(filename: &str, content: Vec<u8>, behavior: Behavior) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral port");
@@ -52,6 +59,7 @@ impl FakeHub {
 
         let body = content.clone();
         let digest = sha256.clone();
+        let advertised = filename.to_string();
         let counter = Arc::clone(&requests);
         tokio::spawn(async move {
             loop {
@@ -61,8 +69,9 @@ impl FakeHub {
                 counter.fetch_add(1, Ordering::SeqCst);
                 let body = body.clone();
                 let digest = digest.clone();
+                let advertised = advertised.clone();
                 tokio::spawn(async move {
-                    let _ = serve(stream, body, digest, behavior).await;
+                    let _ = serve(stream, body, digest, advertised, behavior).await;
                 });
             }
         });
@@ -71,12 +80,17 @@ impl FakeHub {
             endpoint: format!("http://127.0.0.1:{port}"),
             content,
             sha256,
+            filename: filename.to_string(),
             requests,
         }
     }
 
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    pub fn filename(&self) -> &str {
+        &self.filename
     }
 
     pub fn content(&self) -> &[u8] {
@@ -105,13 +119,14 @@ async fn serve(
     mut stream: tokio::net::TcpStream,
     body: Vec<u8>,
     digest: String,
+    filename: String,
     behavior: Behavior,
 ) -> std::io::Result<()> {
     let request = read_request(&mut stream).await?;
     let (method, target) = request_line(&request);
 
     if target.contains("/tree/") {
-        let listing = tree_listing(&digest, body.len(), behavior);
+        let listing = tree_listing(&digest, &filename, body.len(), behavior);
         return write_response(
             &mut stream,
             200,
@@ -177,14 +192,14 @@ async fn serve(
 
 /// The subset of the tree listing the digest lookup reads: one file entry whose
 /// `lfs.sha256` is the declared digest.
-fn tree_listing(digest: &str, size: usize, behavior: Behavior) -> String {
+fn tree_listing(digest: &str, filename: &str, size: usize, behavior: Behavior) -> String {
     let lfs = if behavior == Behavior::NoDeclaredDigest {
         String::new()
     } else {
         format!(",\"lfs\":{{\"sha256\":\"{digest}\",\"size\":{size},\"pointerSize\":134}}")
     };
     format!(
-        "[{{\"type\":\"file\",\"oid\":\"{digest}\",\"path\":\"model.gguf\",\"size\":{size}{lfs}}}]"
+        "[{{\"type\":\"file\",\"oid\":\"{digest}\",\"path\":\"{filename}\",\"size\":{size}{lfs}}}]"
     )
 }
 
