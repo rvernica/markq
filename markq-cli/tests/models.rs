@@ -3,7 +3,7 @@
 
 mod support;
 
-use markq_cli::models::run_pull;
+use markq_cli::models::{ls_rows, run_pull};
 use markq_inference::model_cache::{DigestSidecar, KnownModel, ModelRole};
 use markq_inference::HFClient;
 use support::{Behavior, FakeHub};
@@ -105,4 +105,52 @@ async fn pull_all_roles_reports_each_ready() {
             outcome.result
         );
     }
+}
+
+#[tokio::test]
+async fn pull_then_ls_then_repull_is_a_noop() {
+    let model = KnownModel::Qwen3Embedding06B;
+    let content = sample_content();
+    let hub = FakeHub::spawn_for(model.filename(), content.clone(), Behavior::Complete).await;
+    let client = HFClient::builder()
+        .endpoint(hub.endpoint())
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    // An empty cache: pulling the embedder fetches it from scratch.
+    let first_pull = run_pull(Some("embedder"), dir.path(), &client)
+        .await
+        .unwrap();
+    assert_eq!(first_pull.len(), 1);
+    assert!(first_pull[0].transferred);
+    assert!(first_pull[0].is_ready());
+    let requests_after_first_pull = hub.request_count();
+    assert!(
+        requests_after_first_pull > 0,
+        "an empty cache must contact the hub to fetch the model"
+    );
+
+    // `ls` reports it verified, with the hub's declared digest and size.
+    let rows = ls_rows(dir.path()).unwrap();
+    let embedder_row = rows
+        .iter()
+        .find(|row| row.role == "embedder")
+        .expect("embedder row present");
+    assert_eq!(embedder_row.state, "verified");
+    assert_eq!(embedder_row.size_bytes, Some(content.len() as u64));
+    assert_eq!(embedder_row.digest.as_deref(), Some(hub.sha256()));
+
+    // A second pull transfers nothing and contacts the hub no further.
+    let second_pull = run_pull(Some("embedder"), dir.path(), &client)
+        .await
+        .unwrap();
+    assert_eq!(second_pull.len(), 1);
+    assert!(!second_pull[0].transferred);
+    assert!(second_pull[0].is_ready());
+    assert_eq!(
+        hub.request_count(),
+        requests_after_first_pull,
+        "re-pulling an already-verified model must not contact the hub again"
+    );
 }
