@@ -239,19 +239,26 @@ fn check_one_index(
     }
 }
 
-/// Every known role's model-cache finding (FR-018).
-pub fn check_models(models_dir: &Path) -> anyhow::Result<Vec<Diagnostic>> {
+/// Every known role's model-cache finding (FR-018). `verify` additionally
+/// hashes each cached file's full content (FR-024); without it, an already
+/// cached role is checked by size only (FR-006a).
+pub fn check_models(models_dir: &Path, verify: bool) -> anyhow::Result<Vec<Diagnostic>> {
     let mut findings = Vec::new();
     for role in ModelRole::ALL {
-        findings.extend(check_model(role, models_dir)?);
+        findings.extend(check_model(role, models_dir, verify)?);
     }
     Ok(findings)
 }
 
 /// One role's model-cache finding: presence/completeness/verification, plus
 /// a separate finding when its download lock is currently held (FR-020: this
-/// never loads the model; `CacheEntry::inspect` only stats files).
-fn check_model(role: ModelRole, models_dir: &Path) -> anyhow::Result<Vec<Diagnostic>> {
+/// never loads the model; `CacheEntry::inspect` only stats files, and hashing
+/// under `verify` reads file bytes, never loads them as a model).
+fn check_model(
+    role: ModelRole,
+    models_dir: &Path,
+    verify: bool,
+) -> anyhow::Result<Vec<Diagnostic>> {
     let check = format!("models.{}", role.as_str());
     let model_path = models_dir.join(role.known_model().filename());
     let mut findings = Vec::new();
@@ -269,7 +276,7 @@ fn check_model(role: ModelRole, models_dir: &Path) -> anyhow::Result<Vec<Diagnos
     } else {
         let entry = CacheEntry::inspect(role, models_dir)
             .with_context(|| format!("inspect {} cache entry", role.as_str()))?;
-        findings.push(match entry.state {
+        let mut finding = match entry.state {
             CacheState::Absent => Diagnostic::error(
                 &check,
                 "not cached",
@@ -292,7 +299,28 @@ fn check_model(role: ModelRole, models_dir: &Path) -> anyhow::Result<Vec<Diagnos
                 format!("run `markq models pull {}` to verify it", role.as_str()),
             ),
             CacheState::Verified => Diagnostic::ok(&check),
-        });
+        };
+
+        // The size-only check above can't see a same-length alteration; a
+        // full hash catches it, but only when explicitly requested (FR-024).
+        if verify && entry.state == CacheState::Verified {
+            if let Some(sidecar) = DigestSidecar::read_for(&model_path)? {
+                let actual = markq_inference::sha256_hex(&model_path)?;
+                if !actual.eq_ignore_ascii_case(&sidecar.digest) {
+                    finding = Diagnostic::error(
+                        &check,
+                        format!("full digest {actual} does not match its recorded digest"),
+                        format!("digest {}", sidecar.digest),
+                        format!(
+                            "run `markq models pull {}` to fetch it again",
+                            role.as_str()
+                        ),
+                    );
+                }
+            }
+        }
+
+        findings.push(finding);
     }
 
     if model_cache::download_in_progress(&model_path)? {
@@ -442,7 +470,7 @@ mod tests {
     fn missing_model_names_the_pull_command() {
         let dir = tempfile::tempdir().unwrap();
 
-        let findings = check_model(ModelRole::Embedder, dir.path()).unwrap();
+        let findings = check_model(ModelRole::Embedder, dir.path(), false).unwrap();
 
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].check, "models.embedder");
@@ -466,7 +494,7 @@ mod tests {
         )
         .unwrap();
 
-        let findings = check_model(ModelRole::Embedder, dir.path()).unwrap();
+        let findings = check_model(ModelRole::Embedder, dir.path(), false).unwrap();
 
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Warning);
@@ -491,7 +519,7 @@ mod tests {
         .write_for(&model_path)
         .unwrap();
 
-        let findings = check_model(ModelRole::Embedder, dir.path()).unwrap();
+        let findings = check_model(ModelRole::Embedder, dir.path(), false).unwrap();
 
         assert_eq!(findings.len(), 1);
         assert_ne!(
@@ -526,7 +554,7 @@ mod tests {
             .unwrap();
         fs4::FileExt::try_lock_exclusive(&lock_file).unwrap();
 
-        let findings = check_model(ModelRole::Embedder, dir.path()).unwrap();
+        let findings = check_model(ModelRole::Embedder, dir.path(), false).unwrap();
 
         fs4::FileExt::unlock(&lock_file).unwrap();
 
@@ -571,13 +599,71 @@ mod tests {
         )
         .unwrap();
 
-        let findings = check_model(ModelRole::Embedder, dir.path()).unwrap();
+        let findings = check_model(ModelRole::Embedder, dir.path(), false).unwrap();
 
         assert_eq!(
             findings.len(),
             1,
             "an unheld lock file must not add a finding"
         );
+        assert_eq!(findings[0].severity, Severity::Ok);
+    }
+
+    #[test]
+    fn verify_flag_detects_same_size_alteration() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir
+            .path()
+            .join(ModelRole::Embedder.known_model().filename());
+        let original = b"hello";
+        std::fs::write(&model_path, original).unwrap();
+        markq_inference::model_cache::DigestSidecar {
+            digest: markq_inference::sha256_hex(&model_path).unwrap(),
+            size_bytes: original.len() as u64,
+            source: "hub lfs metadata".into(),
+        }
+        .write_for(&model_path)
+        .unwrap();
+
+        // Same length, different bytes: the size-only check can't see this.
+        std::fs::write(&model_path, b"jello").unwrap();
+
+        let default_findings = check_model(ModelRole::Embedder, dir.path(), false).unwrap();
+        assert_eq!(
+            default_findings[0].severity,
+            Severity::Ok,
+            "a same-size alteration is invisible to the size-only check"
+        );
+
+        let verified_findings = check_model(ModelRole::Embedder, dir.path(), true).unwrap();
+        assert_eq!(
+            verified_findings[0].severity,
+            Severity::Error,
+            "--verify must catch a same-size alteration the size check misses"
+        );
+    }
+
+    #[test]
+    fn default_run_does_not_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir
+            .path()
+            .join(ModelRole::Embedder.known_model().filename());
+        let original = b"hello";
+        std::fs::write(&model_path, original).unwrap();
+        markq_inference::model_cache::DigestSidecar {
+            digest: markq_inference::sha256_hex(&model_path).unwrap(),
+            size_bytes: original.len() as u64,
+            source: "hub lfs metadata".into(),
+        }
+        .write_for(&model_path)
+        .unwrap();
+        std::fs::write(&model_path, b"jello").unwrap();
+
+        // A digest mismatch that only a hash would catch still reads as
+        // verified without --verify, proving the default path checks size
+        // only, matching FR-006a / FR-024.
+        let findings = check_model(ModelRole::Embedder, dir.path(), false).unwrap();
         assert_eq!(findings[0].severity, Severity::Ok);
     }
 
