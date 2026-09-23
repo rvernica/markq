@@ -2,6 +2,13 @@
 //! and identity, index coverage, and model cache state, each finding carrying
 //! a severity and a single actionable next step.
 
+use std::cmp::Ordering;
+use std::path::Path;
+
+use anyhow::Context;
+use markq_core::{DatasetMetadata, Index, EMBEDDING_DIM_DEFAULT, SCHEMA_VERSION};
+use markq_index_lance::LanceIndex;
+use markq_inference::model_cache::ModelRole;
 use serde::Serialize;
 
 /// Severity of one diagnostic finding (data-model.md `Diagnostic`).
@@ -95,9 +102,160 @@ pub fn any_error(findings: &[Diagnostic]) -> bool {
     findings.iter().any(|f| f.severity == Severity::Error)
 }
 
+/// Dataset presence, schema version, and embedder identity (FR-018, FR-023).
+/// Never creates a dataset (FR-025): a path that does not exist is reported
+/// as uninitialized rather than opened via a creating call.
+pub async fn check_dataset(dataset_path: &Path) -> anyhow::Result<Vec<Diagnostic>> {
+    if !dataset_path.exists() {
+        return Ok(vec![Diagnostic::new(
+            "dataset.present",
+            Severity::Ok,
+            Some(format!("no dataset at {}", dataset_path.display())),
+            None,
+            format!("run `markq index {}` to create it", dataset_path.display()),
+        )]);
+    }
+
+    let idx = match LanceIndex::open(dataset_path).await {
+        Ok(idx) => idx,
+        Err(err) => {
+            return Ok(vec![Diagnostic::error(
+                "dataset.present",
+                err.to_string(),
+                "a dataset markq can open",
+                "inspect the dataset directory; if it is corrupt, remove it and run `markq index` to rebuild it",
+            )]);
+        }
+    };
+
+    let mut findings = vec![Diagnostic::ok("dataset.present")];
+    let metadata = idx.metadata().await.context("read dataset metadata")?;
+    findings.push(check_schema_version(metadata.schema_version));
+    findings.push(check_embedder(&metadata));
+    Ok(findings)
+}
+
+/// Compare the dataset's recorded schema version against what this binary
+/// supports. Backward drift (dataset older than the binary) is cleared by
+/// rebuilding the dataset; forward drift (dataset newer than the binary
+/// knows) is cleared by upgrading markq, never by rebuilding data the
+/// current binary can't fully interpret.
+fn check_schema_version(dataset_version: u32) -> Diagnostic {
+    match dataset_version.cmp(&SCHEMA_VERSION) {
+        Ordering::Equal => Diagnostic::ok("dataset.schema_version"),
+        Ordering::Less => Diagnostic::error(
+            "dataset.schema_version",
+            dataset_version.to_string(),
+            SCHEMA_VERSION.to_string(),
+            format!("run `markq index` to rebuild the dataset at schema_version {SCHEMA_VERSION}"),
+        ),
+        Ordering::Greater => Diagnostic::error(
+            "dataset.schema_version",
+            dataset_version.to_string(),
+            SCHEMA_VERSION.to_string(),
+            "upgrade markq to a version that supports this dataset's schema_version".to_string(),
+        ),
+    }
+}
+
+/// Compare the dataset's recorded embedder identity and dimension against
+/// the configured embedder. A dataset that has never been embedded records
+/// neither and has nothing to compare, which is not a problem on its own.
+fn check_embedder(metadata: &DatasetMetadata) -> Diagnostic {
+    let configured_model = ModelRole::Embedder.known_model().id();
+    let configured_dim = EMBEDDING_DIM_DEFAULT as u32;
+
+    let (Some(recorded_model), Some(recorded_dim)) =
+        (&metadata.embedder_model, metadata.embedder_dim)
+    else {
+        return Diagnostic::ok("dataset.embedder");
+    };
+
+    if recorded_dim != configured_dim {
+        return Diagnostic::error(
+            "dataset.embedder",
+            format!("dim={recorded_dim}"),
+            format!("dim={configured_dim}"),
+            "re-embed the dataset with `markq embed` using the configured embedder, or reconfigure the embedder to match".to_string(),
+        );
+    }
+    if recorded_model != configured_model {
+        return Diagnostic::error(
+            "dataset.embedder",
+            format!("model={recorded_model}"),
+            format!("model={configured_model}"),
+            "re-embed the dataset with `markq embed` using the configured embedder, or reconfigure the embedder to match".to_string(),
+        );
+    }
+    Diagnostic::ok("dataset.embedder")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use markq_core::{DatasetMetadata, SCHEMA_VERSION};
+
+    #[tokio::test]
+    async fn uninitialized_dataset_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let dataset_path = dir.path().join("chunks.lance");
+
+        let findings = check_dataset(&dataset_path).await.unwrap();
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].check, "dataset.present");
+        assert_eq!(findings[0].severity, Severity::Ok);
+        assert!(
+            !findings[0].next_step.is_empty(),
+            "an uninitialized dataset must still name a next step"
+        );
+    }
+
+    #[test]
+    fn schema_drift_names_both_versions() {
+        let dataset_version = 0;
+        let d = check_schema_version(dataset_version);
+        assert_eq!(d.severity, Severity::Error);
+        assert_eq!(d.observed.as_deref(), Some("0"));
+        assert_eq!(
+            d.expected.as_deref(),
+            Some(SCHEMA_VERSION.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn forward_drift_suggests_upgrade() {
+        let d = check_schema_version(SCHEMA_VERSION + 1);
+        assert_eq!(d.severity, Severity::Error);
+        assert!(
+            d.next_step.to_ascii_lowercase().contains("upgrade"),
+            "forward drift should point at upgrading markq, got: {}",
+            d.next_step
+        );
+    }
+
+    #[test]
+    fn embedder_dim_mismatch_names_both_values() {
+        let metadata = DatasetMetadata {
+            schema_version: SCHEMA_VERSION,
+            lance_manifest_version: 1,
+            lance_file_format_version: "2.1".to_string(),
+            lancedb_crate_version: "0.27.2".to_string(),
+            embedder_model: Some(
+                markq_inference::model_cache::ModelRole::Embedder
+                    .known_model()
+                    .id()
+                    .to_string(),
+            ),
+            embedder_dim: Some(4),
+        };
+
+        let d = check_embedder(&metadata);
+
+        assert_eq!(d.severity, Severity::Error);
+        assert!(d.observed.as_deref().unwrap().contains('4'));
+        assert!(d.expected.as_deref().unwrap().contains("1024"));
+    }
 
     #[test]
     fn any_error_finding_yields_failure_status() {
