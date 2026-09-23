@@ -66,10 +66,28 @@ pub async fn download_model(
     client: &HFClient,
     model: KnownModel,
     models_dir: &Path,
+    offline: Option<&str>,
 ) -> Result<PathBuf> {
+    let role = role_for(model);
+    let target = models_dir.join(model.filename());
+
+    // A cache that is already verified needs nothing from the network, which is
+    // what makes "no request when every model is present" hold for every
+    // caller rather than only the ones that remember to check.
+    if CacheEntry::inspect(role, models_dir)?.state == CacheState::Verified {
+        return Ok(target);
+    }
+
+    if let Some(setting) = offline {
+        return Err(markq_core::Error::OfflineRefused {
+            role: role.as_str().to_string(),
+            setting: setting.to_string(),
+        }
+        .into());
+    }
+
     std::fs::create_dir_all(models_dir)
         .with_context(|| format!("create models dir {}", models_dir.display()))?;
-    let target = models_dir.join(model.filename());
     let partial = partial_path_for(&target);
 
     // Hold this model's lock for the rest of the function, so a second

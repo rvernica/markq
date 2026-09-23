@@ -85,7 +85,9 @@ async fn interrupted_download_resumes_from_partial() {
     let already_have = 1024;
     std::fs::write(partial_path_for(&target), &content[..already_have]).unwrap();
 
-    let path = download_model(&client, model, dir.path()).await.unwrap();
+    let path = download_model(&client, model, dir.path(), None)
+        .await
+        .unwrap();
 
     assert_eq!(std::fs::read(&path).unwrap(), content);
     assert_eq!(hub.last_range().map(|(start, _)| start), Some(1024));
@@ -112,7 +114,7 @@ async fn partial_file_is_never_used_as_complete() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join(model.filename());
 
-    let result = download_model(&client, model, dir.path()).await;
+    let result = download_model(&client, model, dir.path(), None).await;
 
     assert!(result.is_err(), "a short transfer must not report success");
     assert!(
@@ -148,7 +150,7 @@ async fn second_download_of_same_model_fails_immediately() {
         .unwrap();
     held.try_lock_exclusive().unwrap();
 
-    let result = download_model(&client, model, dir.path()).await;
+    let result = download_model(&client, model, dir.path(), None).await;
 
     let message = result.unwrap_err().to_string();
     assert!(
@@ -186,7 +188,7 @@ async fn downloads_of_different_models_do_not_block() {
         .build()
         .unwrap();
 
-    let result = download_model(&client, reranker, dir.path()).await;
+    let result = download_model(&client, reranker, dir.path(), None).await;
 
     assert!(
         result.is_ok(),
@@ -211,7 +213,7 @@ async fn failed_verification_leaves_no_loadable_model() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join(model.filename());
 
-    let error = download_model(&client, model, dir.path())
+    let error = download_model(&client, model, dir.path(), None)
         .await
         .unwrap_err();
     assert!(
@@ -230,5 +232,72 @@ async fn failed_verification_leaves_no_loadable_model() {
             .unwrap()
             .state,
         CacheState::Partial { bytes: 4096 }
+    );
+}
+
+#[tokio::test]
+async fn offline_missing_model_names_model_and_setting() {
+    let model = KnownModel::Qwen3Embedding06B;
+    let hub = FakeHub::spawn_for(model.filename(), sample_content(), Behavior::Complete).await;
+    let client = HFClient::builder()
+        .endpoint(hub.endpoint())
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    let error = download_model(&client, model, dir.path(), Some("MARKQ_OFFLINE"))
+        .await
+        .unwrap_err();
+    let message = error.to_string();
+
+    assert!(message.contains("embedder"), "got: {message}");
+    assert!(message.contains("MARKQ_OFFLINE"), "got: {message}");
+}
+
+#[tokio::test]
+async fn offline_pull_refuses_without_contacting_the_hub() {
+    let model = KnownModel::Qwen3Embedding06B;
+    let hub = FakeHub::spawn_for(model.filename(), sample_content(), Behavior::Complete).await;
+    let client = HFClient::builder()
+        .endpoint(hub.endpoint())
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    let _ = download_model(&client, model, dir.path(), Some("--offline")).await;
+
+    assert_eq!(
+        hub.request_count(),
+        0,
+        "offline mode must refuse before reaching the hub"
+    );
+}
+
+#[tokio::test]
+async fn complete_cache_makes_no_request_with_offline_unset() {
+    let model = KnownModel::Qwen3Embedding06B;
+    let content = sample_content();
+    let hub = FakeHub::spawn_for(model.filename(), content.clone(), Behavior::Complete).await;
+    let client = HFClient::builder()
+        .endpoint(hub.endpoint())
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    // Fill the cache the way a completed download leaves it.
+    download_model(&client, model, dir.path(), None)
+        .await
+        .unwrap();
+    let after_fetch = hub.request_count();
+    assert!(after_fetch > 0, "the first fetch should have used the hub");
+
+    // A cache that is already complete needs nothing, offline flag or not.
+    download_model(&client, model, dir.path(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        hub.request_count(),
+        after_fetch,
+        "a verified cache must not produce another request"
     );
 }

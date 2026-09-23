@@ -22,6 +22,47 @@ const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (backend: cuda)");
 #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (backend: cpu)");
 
+/// The environment variable that forbids network access.
+const OFFLINE_VARIABLE: &str = "MARKQ_OFFLINE";
+
+/// Which setting forbade network access, for an error that can name it. `None`
+/// means the network may be used.
+type OfflineSetting = Option<String>;
+
+/// Resolve the offline setting: the flag beats the variable, which beats the
+/// default of allowing the network.
+fn resolve_offline(flag: bool, value: Option<&str>) -> markq_core::Result<OfflineSetting> {
+    if flag {
+        return Ok(Some("--offline".to_string()));
+    }
+    Ok(if parse_offline_value(value)? {
+        Some(OFFLINE_VARIABLE.to_string())
+    } else {
+        None
+    })
+}
+
+/// Interpret one value of the offline variable.
+///
+/// Takes the value rather than reading the environment, so callers and tests
+/// share one definition of what is accepted without mutating process-global
+/// state. An unrecognized value is an error: silently reading `no` as "offline
+/// on" would forbid the network the user asked for.
+fn parse_offline_value(value: Option<&str>) -> markq_core::Result<bool> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        _ => Err(markq_core::Error::InvalidOfflineValue {
+            variable: OFFLINE_VARIABLE,
+            value: value.to_string(),
+            accepted: "1, true, 0, false".to_string(),
+        }),
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "markq",
@@ -32,6 +73,10 @@ struct Cli {
     /// Path to the chunk dataset. Defaults to `~/.markq/chunks.lance`.
     #[arg(long, global = true)]
     dataset: Option<PathBuf>,
+
+    /// Forbid all network access. Also set by `MARKQ_OFFLINE=1`.
+    #[arg(long, global = true)]
+    offline: bool,
 
     #[command(subcommand)]
     cmd: Command,
@@ -236,6 +281,7 @@ async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     let dataset_path = cli.dataset.clone().unwrap_or_else(default_dataset_path);
+    let offline = resolve_offline(cli.offline, std::env::var(OFFLINE_VARIABLE).ok().as_deref())?;
 
     match cli.cmd {
         Command::Inspect => cmd_inspect(&dataset_path).await,
@@ -247,7 +293,7 @@ async fn main() -> Result<()> {
         Command::Vsearch(args) => cmd_vsearch(&dataset_path, &args).await,
         Command::Query(args) => cmd_query(&dataset_path, &args).await,
         Command::Rerank(args) => cmd_rerank(&args).await,
-        Command::Models(cmd) => cmd_models(cmd).await,
+        Command::Models(cmd) => cmd_models(cmd, offline.as_deref()).await,
         Command::Doctor(args) => cmd_doctor(&dataset_path, &args).await,
 
         // Every other v1 subcommand has its name + arg shape registered now
@@ -403,12 +449,12 @@ async fn cmd_rerank(args: &RerankArgs) -> Result<()> {
     .await
 }
 
-async fn cmd_models(cmd: ModelsCmd) -> Result<()> {
+async fn cmd_models(cmd: ModelsCmd, offline: Option<&str>) -> Result<()> {
     match cmd {
         ModelsCmd::Pull { role } => {
             let models_dir = markq_inference::models_dir();
             let client = markq_inference::HFClient::new().context("HFClient::new")?;
-            let outcomes = models::run_pull(role.as_deref(), &models_dir, &client).await?;
+            let outcomes = models::run_pull(role.as_deref(), &models_dir, &client, offline).await?;
 
             let mut any_failed = false;
             for outcome in &outcomes {
@@ -613,4 +659,76 @@ fn init_tracing() {
         .with(filter)
         .with(fmt::layer().with_target(true).with_writer(std::io::stderr))
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offline_flag_accepted_on_every_subcommand() {
+        // A user should never have to know which subcommands reach the network.
+        for argv in [
+            vec!["markq", "--offline", "inspect"],
+            vec!["markq", "inspect", "--offline"],
+            vec!["markq", "search", "needle", "--offline"],
+            vec!["markq", "query", "needle", "--offline"],
+            vec!["markq", "doctor", "--offline"],
+            vec!["markq", "models", "ls", "--offline"],
+        ] {
+            let parsed = Cli::try_parse_from(&argv)
+                .unwrap_or_else(|error| panic!("{argv:?} rejected: {error}"));
+            assert!(parsed.offline, "{argv:?} did not set offline");
+        }
+    }
+
+    #[test]
+    fn flag_overrides_env_which_overrides_default() {
+        assert_eq!(resolve_offline(false, None).unwrap(), None);
+        assert_eq!(
+            resolve_offline(false, Some("1")).unwrap().as_deref(),
+            Some("MARKQ_OFFLINE")
+        );
+        assert_eq!(
+            resolve_offline(true, None).unwrap().as_deref(),
+            Some("--offline")
+        );
+        // The flag is the stronger statement, so it wins over a variable that
+        // says otherwise.
+        assert_eq!(
+            resolve_offline(true, Some("0")).unwrap().as_deref(),
+            Some("--offline")
+        );
+        assert_eq!(resolve_offline(false, Some("false")).unwrap(), None);
+    }
+
+    #[test]
+    fn offline_env_accepts_documented_values_case_insensitively() {
+        for on in ["1", "true", "TRUE", "True"] {
+            assert!(
+                parse_offline_value(Some(on)).unwrap(),
+                "{on:?} should mean offline"
+            );
+        }
+        for off in ["0", "false", "FALSE", "False"] {
+            assert!(
+                !parse_offline_value(Some(off)).unwrap(),
+                "{off:?} should mean online"
+            );
+        }
+        assert!(
+            !parse_offline_value(None).unwrap(),
+            "unset should mean online"
+        );
+    }
+
+    #[test]
+    fn offline_env_rejects_unrecognized_value() {
+        let error = parse_offline_value(Some("maybe")).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("MARKQ_OFFLINE"), "got: {message}");
+        assert!(message.contains("maybe"), "got: {message}");
+        // The message has to say what would have worked.
+        assert!(message.contains("true"), "got: {message}");
+    }
 }

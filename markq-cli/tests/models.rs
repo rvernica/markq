@@ -19,7 +19,7 @@ async fn pull_unknown_role_lists_valid_roles() {
         .build()
         .unwrap();
 
-    let err = run_pull(Some("embeder"), dir.path(), &client)
+    let err = run_pull(Some("embeder"), dir.path(), &client, None)
         .await
         .unwrap_err();
     let message = err.to_string();
@@ -48,7 +48,7 @@ async fn pull_already_verified_transfers_nothing() {
     .write_for(&target)
     .unwrap();
 
-    let outcomes = run_pull(Some("reranker"), dir.path(), &client)
+    let outcomes = run_pull(Some("reranker"), dir.path(), &client, None)
         .await
         .unwrap();
 
@@ -92,7 +92,7 @@ async fn pull_all_roles_reports_each_ready() {
     .write_for(&reranker_target)
     .unwrap();
 
-    let outcomes = run_pull(None, dir.path(), &client).await.unwrap();
+    let outcomes = run_pull(None, dir.path(), &client, None).await.unwrap();
 
     assert_eq!(outcomes.len(), ModelRole::ALL.len());
     for outcome in &outcomes {
@@ -117,7 +117,7 @@ async fn pull_then_ls_then_repull_is_a_noop() {
     let dir = tempfile::tempdir().unwrap();
 
     // An empty cache: pulling the embedder fetches it from scratch.
-    let first_pull = run_pull(Some("embedder"), dir.path(), &client)
+    let first_pull = run_pull(Some("embedder"), dir.path(), &client, None)
         .await
         .unwrap();
     assert_eq!(first_pull.len(), 1);
@@ -140,7 +140,7 @@ async fn pull_then_ls_then_repull_is_a_noop() {
     assert_eq!(embedder_row.digest.as_deref(), Some(hub.sha256()));
 
     // A second pull transfers nothing and contacts the hub no further.
-    let second_pull = run_pull(Some("embedder"), dir.path(), &client)
+    let second_pull = run_pull(Some("embedder"), dir.path(), &client, None)
         .await
         .unwrap();
     assert_eq!(second_pull.len(), 1);

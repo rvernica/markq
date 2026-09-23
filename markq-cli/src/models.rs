@@ -30,6 +30,7 @@ pub async fn run_pull(
     role_name: Option<&str>,
     models_dir: &Path,
     client: &HFClient,
+    offline: Option<&str>,
 ) -> Result<Vec<PullOutcome>> {
     let roles = resolve_roles(role_name)?;
     let mut outcomes = Vec::with_capacity(roles.len());
@@ -45,7 +46,7 @@ pub async fn run_pull(
             continue;
         }
 
-        let result = match download_model(client, role.known_model(), models_dir).await {
+        let result = match download_model(client, role.known_model(), models_dir, offline).await {
             Ok(_) => CacheEntry::inspect(role, models_dir).map_err(|err| err.to_string()),
             Err(err) => Err(err.to_string()),
         };
